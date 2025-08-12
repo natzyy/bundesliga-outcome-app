@@ -3,6 +3,7 @@ import pandas as pd
 import joblib
 import numpy as np
 import altair as alt
+import os, requests
 from pathlib import Path
 
 # -------------------------------------------------
@@ -54,6 +55,72 @@ try:
 except Exception as e:
     st.warning(f"Konnte CSVs nicht laden: {e}")
     df_all = pd.DataFrame(columns=["HomeTeam","AwayTeam","B365H","B365D","B365A","PSH","PSD","PSA","Date"])
+
+# -------------------------------------------------
+# Live-Quoten (The Odds API) holen
+# -------------------------------------------------
+@st.cache_data(ttl=300)
+def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga", want_books=("pinnacle","bet365")):
+    api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", ""))
+    if not api_key:
+        raise RuntimeError("Kein ODDS_API_KEY gefunden (Secrets oder Umgebungsvariable).")
+
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+    params = {
+        "apiKey": api_key,
+        "regions": "eu,uk",
+        "oddsFormat": "decimal",
+        "markets": "h2h",
+        "bookmakers": ",".join(want_books),
+    }
+    r = requests.get(url, params=params, timeout=12)
+    r.raise_for_status()
+    data = r.json()
+
+    def norm(s):
+        return s.lower().replace("ü","u").replace("ß","ss").replace("ö","o").replace("ä","a").strip()
+
+    tgt_home, tgt_away = norm(home_team), norm(away_team)
+
+    match = None
+    for ev in data:
+        teams = [norm(t) for t in ev.get("teams", [])]
+        if tgt_home in teams and tgt_away in teams:
+            match = ev
+            break
+    if not match:
+        raise LookupError("Kein passendes Event für diese Teams gefunden.")
+
+    res = {}
+    for bk in match.get("bookmakers", []):
+        bname = bk.get("key","").lower()
+        if bname not in want_books:
+            continue
+        for m in bk.get("markets", []):
+            if m.get("key") != "h2h":
+                continue
+            for out in m.get("outcomes", []):
+                name_raw = out.get("name","")
+                name = name_raw.lower()
+                price = float(out.get("price"))
+                code = None
+                if name in ("draw","unentschieden"):
+                    code = "D"
+                else:
+                    if norm(name_raw) == tgt_home or name in ("home","heim"):
+                        code = "H"
+                    elif norm(name_raw) == tgt_away or name in ("away","auswärt","auswaerts","auswärts"):
+                        code = "A"
+                if not code:
+                    continue
+                if "pinnacle" in bname:
+                    res[f"PS{code}"] = price
+                elif "bet365" in bname:
+                    res[f"B365{code}"] = price
+
+    need = ["B365H","B365D","B365A","PSH","PSD","PSA"]
+    missing = [k for k in need if k not in res]
+    return res, missing
 
 
 # -------------------------------------------------
@@ -116,6 +183,20 @@ with colA:
         home_team = st.text_input("Heimmannschaft", "Bayern Munich")
 
 with colB:
+    # --- Live-Quoten nur im Zukunftsmodus laden ---
+if mode.startswith("Zukünftiges"):
+    if st.button("🔄 Live-Quoten laden (Bet365 & Pinnacle)"):
+        try:
+            odds, missing = fetch_live_odds(home_team, away_team)
+            for k, v in odds.items():
+                st.session_state[k] = float(v)
+            if missing:
+                st.warning("Nicht alle Quoten verfügbar: " + ", ".join(missing))
+            else:
+                st.success("Live-Quoten geladen.")
+        except Exception as e:
+            st.error(f"Live-Quoten konnten nicht geladen werden: {e}")
+
     if teams:
         away_team = st.selectbox(
             "Auswärtsmannschaft",
@@ -292,5 +373,6 @@ if go:
 - **Historischer Modus:** holt **nur** damals gültige Quoten automatisch.
 - **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote, auf 100 % normiert (Overround entfernt).
 """)
+
 
 

@@ -10,7 +10,6 @@ from pathlib import Path
 # Seite konfigurieren
 # -------------------------------------------------
 st.set_page_config(page_title="Bundesliga Spielergebnis", page_icon="⚽", layout="centered")
-st.sidebar.success("Build: 12-08 23:59 — MODE-UI")
 
 # --- DEBUG: zeigt, ob die CSVs da sind ---
 import os, glob
@@ -61,56 +60,90 @@ except Exception as e:
 # -------------------------------------------------
 @st.cache_data(ttl=300)
 def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga", want_books=("pinnacle","bet365")):
-    api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", ""))
-    if not api_key:
-        raise RuntimeError("Kein ODDS_API_KEY gefunden (Secrets oder Umgebungsvariable).")
+    import re, unicodedata, os, requests, streamlit as st
+
+    api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
+    if not api_key or "DEIN_" in api_key.upper():
+        raise RuntimeError("ODDS_API_KEY fehlt/Platzhalter. In Streamlit > Settings > Secrets eintragen.")
+
+    def norm(s: str) -> str:
+        s = s or ""
+        s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+        s = s.lower()
+        s = re.sub(r"[^a-z0-9 ]", " ", s)
+        s = re.sub(r"\b(fc|sv|tsg|vfl|sc|borussia|bayer|1|04|05|1899|98|04)\b", " ", s)
+        s = " ".join(s.split())
+        return s
+
+    ALIASES = {
+        "bayern munich": ["bayern munich", "bayern munchen", "fc bayern munchen", "bayern"],
+        "augsburg": ["augsburg", "fc augsburg"],
+        "borussia dortmund": ["borussia dortmund", "dortmund"],
+        "rb leipzig": ["rb leipzig", "leipzig", "rasenballsport leipzig"],
+        "bayer leverkusen": ["bayer leverkusen", "leverkusen"],
+        "borussia monchengladbach": ["borussia monchengladbach", "monchengladbach", "gladbach"],
+        "koln": ["koln", "fc koln", "1 fc koln", "koln 1 fc", "kolner"],
+        "union berlin": ["union berlin", "1 fc union berlin", "union"],
+        "eintracht frankfurt": ["eintracht frankfurt", "frankfurt"],
+        "werder bremen": ["werder bremen", "bremen"],
+        "vfb stuttgart": ["stuttgart", "vfb stuttgart"],
+        "vfl wolfsburg": ["wolfsburg"],
+        "sc freiburg": ["freiburg"],
+        "mainz": ["mainz", "mainz 05"],
+        "tsg hoffenheim": ["hoffenheim"],
+        "vfl bochum": ["bochum"],
+        "heidenheim": ["heidenheim", "1 fc heidenheim"],
+        "darmstadt": ["darmstadt", "sv darmstadt"],
+        "st pauli": ["st pauli", "fc st pauli"],
+        "fortuna dusseldorf": ["fortuna dusseldorf", "fortuna"],
+        "hamburger sv": ["hamburger sv", "hamburg"],
+    }
+
+    def alias_set(s):
+        k = norm(s)
+        return set([k] + ALIASES.get(k, []))
+
+    nh, na = alias_set(home_team), alias_set(away_team)
 
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
     params = {
-        "apiKey": api_key,
-        "regions": "eu,uk",
-        "oddsFormat": "decimal",
-        "markets": "h2h",
-        "bookmakers": ",".join(want_books),
+        "apiKey": api_key, "regions": "eu,uk", "oddsFormat": "decimal",
+        "markets": "h2h", "bookmakers": ",".join(want_books)
     }
     r = requests.get(url, params=params, timeout=12)
     r.raise_for_status()
     data = r.json()
 
-    def norm(s):
-        return s.lower().replace("ü","u").replace("ß","ss").replace("ö","o").replace("ä","a").strip()
-
-    tgt_home, tgt_away = norm(home_team), norm(away_team)
-
     match = None
     for ev in data:
         teams = [norm(t) for t in ev.get("teams", [])]
-        if tgt_home in teams and tgt_away in teams:
+        if (any(t in nh for t in teams) and any(t in na for t in teams)) or \
+           (any(t in na for t in teams) and any(t in nh for t in teams)):
             match = ev
             break
+
     if not match:
-        raise LookupError("Kein passendes Event für diese Teams gefunden.")
+        raise LookupError("Kein passendes Event für diese Teams gefunden (evtl. kein anstehendes Spiel oder Namensvariante).")
 
     res = {}
     for bk in match.get("bookmakers", []):
-        bname = bk.get("key","").lower()
+        bname = (bk.get("key","") or "").lower()
         if bname not in want_books:
             continue
         for m in bk.get("markets", []):
             if m.get("key") != "h2h":
                 continue
             for out in m.get("outcomes", []):
-                name_raw = out.get("name","")
-                name = name_raw.lower()
+                nm_raw = out.get("name","")
+                nm = norm(nm_raw)
                 price = float(out.get("price"))
                 code = None
-                if name in ("draw","unentschieden"):
+                if nm in ("draw", "unentschieden"):
                     code = "D"
-                else:
-                    if norm(name_raw) == tgt_home or name in ("home","heim"):
-                        code = "H"
-                    elif norm(name_raw) == tgt_away or name in ("away","auswärt","auswaerts","auswärts"):
-                        code = "A"
+                elif nm in nh:
+                    code = "H"
+                elif nm in na:
+                    code = "A"
                 if not code:
                     continue
                 if "pinnacle" in bname:
@@ -197,7 +230,9 @@ with colB:
 # -------------------------
 # Live-Quoten (nur im Zukunfts-Modus)
 # -------------------------
+# --- Live-Quoten (nur im Zukunfts-Modus) ---
 if mode.startswith("Zukünftiges"):
+    # Button: Live-Quoten laden
     if st.button("🔄 Live-Quoten laden (Bet365 & Pinnacle)"):
         try:
             odds, missing = fetch_live_odds(home_team, away_team)
@@ -209,6 +244,22 @@ if mode.startswith("Zukünftiges"):
                 st.success("Live-Quoten geladen.")
         except Exception as e:
             st.error(f"Live-Quoten konnten nicht geladen werden: {e}")
+
+    # Optional: aktuell verfügbare Spiele anzeigen
+    with st.expander("Welche Spiele kennt die API gerade?"):
+        try:
+            api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
+            if api_key:
+                url = "https://api.the-odds-api.com/v4/sports/soccer_germany_bundesliga/odds"
+                params = {"apiKey": api_key, "regions": "eu,uk", "oddsFormat": "decimal", "markets": "h2h"}
+                resp = requests.get(url, params=params, timeout=12)
+                resp.raise_for_status()
+                items = resp.json()
+                st.write([f"{it['teams'][0]} vs {it['teams'][1]} — {it.get('commence_time','')}" for it in items])
+            else:
+                st.info("Kein ODDS_API_KEY gesetzt.")
+        except Exception as e:
+            st.warning(f"Listing fehlgeschlagen: {e}")
 
 # -------------------------
 # Historischer CSV-Lookup (nur im Historik-Modus)
@@ -377,7 +428,3 @@ if go:
 - **Historischer Modus:** holt **nur** damals gültige Quoten automatisch.
 - **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote, auf 100 % normiert (Overround entfernt).
 """)
-
-
-
-

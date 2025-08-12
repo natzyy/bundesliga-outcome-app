@@ -187,11 +187,11 @@ if "Date" in df_all.columns and df_all["Date"].notna().any():
         train_span = f"Trainiert auf historischen Spielen ca. {dmin.date()} bis {dmax.date()}."
 st.info(
     "ℹ️ **Hinweis**\n\n"
-    "**Zukünftiges Spiel:** echte Prognose auf Basis der aktuell eingegebenen/geladenen Quoten.\n"
-    "**Historischer Modus (Backtest):** lädt die damaligen Quoten; das Ergebnis ist bereits bekannt – "
-    "wir prüfen nur, wie gut das Modell getroffen **hätte** (keine Live-Prognose)."
+    "**Zukünftiges Spiel = echte Prognose:** Das Modell berechnet eine Vorhersage auf Basis der aktuell geladenen oder manuell eingegebenen Quoten.\n\n"
+    "**Historisches Spiel = Backtest:** Die damaligen Quoten werden geladen; das tatsächliche Ergebnis ist bereits bekannt – wir prüfen nur, wie gut das Modell **getroffen hätte** (keine Live-Prognose)."
     + (f"\n\n{train_span}" if train_span else "")
 )
+
 
 # -------------------------
 # Eingaben (Teams)
@@ -438,4 +438,5 @@ if go:
 - **Historischer Modus:** holt **nur** damals gültige Quoten automatisch.
 - **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote, auf 100 % normiert (Overround entfernt).
 """)
+
 

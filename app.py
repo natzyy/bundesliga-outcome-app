@@ -9,6 +9,12 @@ from pathlib import Path
 # Seite konfigurieren
 # -------------------------------------------------
 st.set_page_config(page_title="Bundesliga Spielergebnis", page_icon="⚽", layout="centered")
+# --- DEBUG: zeigt, ob die CSVs da sind ---
+import os, glob
+VERSION = "UI-Mode + CSV debug"
+st.sidebar.success(f"Build: {VERSION}")
+st.sidebar.write("CWD:", os.getcwd())
+st.sidebar.write("data/*.csv:", glob.glob("data/*.csv"))
 
 # -------------------------------------------------
 # Daten laden (historische CSVs für Quoten-Autofill)
@@ -47,6 +53,7 @@ except Exception as e:
     st.warning(f"Konnte CSVs nicht laden: {e}")
     df_all = pd.DataFrame(columns=["HomeTeam","AwayTeam","B365H","B365D","B365A","PSH","PSD","PSA","Date"])
 
+
 # -------------------------------------------------
 # Modell laden + Teamliste aus OneHotEncoder extrahieren
 # -------------------------------------------------
@@ -66,12 +73,15 @@ except Exception:
 # -------------------------------------------------
 st.title("⚽ Bundesliga Spielergebnis – Vorhersage")
 
+has_history = not df_all.empty
+choices = ["Zukünftiges Spiel (manuelle Quoten)"] + (["Historisches Spiel (Quoten aus CSV)"] if has_history else [])
 mode = st.radio(
     "Vorhersage-Modus",
-    ["Zukünftiges Spiel (manuelle Quoten)", "Historisches Spiel (Quoten aus CSV)"],
+    choices,
     index=0,
     help="Historischer Modus holt nur bequem die damaligen Quoten. Die Vorhersage basiert IMMER auf einem Modell, das auf vielen vergangenen Jahren trainiert wurde."
 )
+
 
 # Trainingszeitraum aus CSVs anzeigen (nur als Info)
 train_span = ""
@@ -280,3 +290,4 @@ if go:
 - **Historischer Modus:** holt **nur** damals gültige Quoten automatisch.
 - **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote, auf 100 % normiert (Overround entfernt).
 """)
+

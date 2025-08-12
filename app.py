@@ -96,6 +96,18 @@ def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga",
 
     nh, na = _alias_set(home_team), _alias_set(away_team)
 
+    # --- neuer Helfer: robustes Matching (auch Teilstrings) ---
+    def _any_match(user_set: set, ev_name: str) -> bool:
+        """Matcht auch Teilstrings: 'ein frankfurt' ~ 'eintracht frankfurt'."""
+        evn = _norm(ev_name)
+        if evn in user_set:
+            return True
+        # Teilstring / Token-Overlap
+        for u in user_set:
+            if u in evn or evn in u:
+                return True
+        return False
+
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
     params = {
         "apiKey": api_key,
@@ -108,18 +120,23 @@ def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga",
     r.raise_for_status()
     data = r.json()  # v4: list of events with home_team / away_team
 
+    # --- ERSETZTER MATCH-LOOP: nutzt _any_match und setzt flip korrekt ---
     match = None
     flip = False  # falls API-Home != User-Home
     for ev in data:
-        ev_home = _norm(ev.get("home_team", ""))
-        ev_away = _norm(ev.get("away_team", ""))
-        if (ev_home in nh and ev_away in na) or (ev_home in na and ev_away in nh):
+        ev_home_raw = ev.get("home_team", "")
+        ev_away_raw = ev.get("away_team", "")
+        if (_any_match(nh, ev_home_raw) and _any_match(na, ev_away_raw)) or \
+           (_any_match(nh, ev_away_raw) and _any_match(na, ev_home_raw)):
             match = ev
-            flip = (ev_home in na and ev_away in nh)
+            # Flip, wenn API-Home eigentlich unser Auswärts ist
+            flip = (_any_match(nh, ev_away_raw) and _any_match(na, ev_home_raw))
             break
+
     if not match:
         raise LookupError("Kein passendes Event für diese Teams gefunden (evtl. kein anstehendes Spiel oder Namensvariante).")
 
+    # Quoten extrahieren
     res = {}
     for bk in match.get("bookmakers", []):
         bname = (bk.get("key","") or "").lower()
@@ -457,3 +474,4 @@ if go:
 - **Historischer Modus:** holt **nur** damals gültige Quoten automatisch.
 - **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote, auf 100 % normiert (Overround entfernt).
 """)
+

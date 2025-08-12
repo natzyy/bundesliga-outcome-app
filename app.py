@@ -4,6 +4,7 @@ import joblib
 import numpy as np
 import altair as alt
 import os, requests, glob, re, unicodedata
+import time
 from pathlib import Path
 
 # -------------------------------------------------
@@ -95,11 +96,22 @@ def _alias_set(name: str) -> set:
     k = _norm(name)
     return set([k] + ALIASES.get(k, []))
 
-@st.cache_data(ttl=300)
-def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga", want_books=("pinnacle","bet365")):
-    api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
-    if not api_key or "DEIN_" in api_key.upper():
-        raise RuntimeError("ODDS_API_KEY fehlt/Platzhalter. In Streamlit > Settings > Secrets eintragen.")
+# 1) fetch_live_odds erlaubt optionalen Nonce
+@st.cache_data(ttl=60)
+def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga",
+                    want_books=("pinnacle","bet365"), _nonce:int=0):
+    ...
+    # z. B. Regions etwas breiter:
+    params = {
+        "apiKey": api_key,
+        "regions": "eu,uk,us",     # etwas breiter, schadet nicht
+        "oddsFormat": "decimal",
+        "markets": "h2h",
+        "bookmakers": ",".join(want_books),
+        "_": _nonce                # nur für Cache-Key deiner App
+    }
+    ...
+
 
     nh, na = _alias_set(home_team), _alias_set(away_team)
 
@@ -230,14 +242,31 @@ with colB:
 # Live-Quoten (nur im Zukunfts-Modus)
 # -------------------------
 if mode.startswith("Zukünftiges"):
-    if st.button("🔄 Live-Quoten laden (Bet365 & Pinnacle)"):
+
+    # Zwei Buttons: normal und "Cache ignorieren"
+    c1, c2 = st.columns(2)
+    with c1:
+        refresh = st.button("🔄 Live-Quoten laden (Bet365 & Pinnacle)")
+    with c2:
+        hard_refresh = st.button("⟳ Live-Quoten (Cache ignorieren)")
+
+    if refresh or hard_refresh:
         try:
-            odds, missing = fetch_live_odds(home_team, away_team)
+            # Cache-Buster (nur beim harten Refresh)
+            nonce = int(time.time()) if hard_refresh else 0
+
+            odds, missing = fetch_live_odds(home_team, away_team, _nonce=nonce)
+
+            # Reset Hinweise
             st.session_state["odds_note"] = ""
             st.session_state["odds_source_hint"] = None
             st.session_state["odds_origin"] = None
+
+            # 1) Gelieferte Werte setzen
             for k, v in odds.items():
                 st.session_state[k] = float(v)
+
+            # 2) Fallback spiegeln
             for b365, ps in [("B365H","PSH"), ("B365D","PSD"), ("B365A","PSA")]:
                 if b365 in missing and ps in odds:
                     st.session_state[b365] = float(odds[ps])
@@ -245,6 +274,7 @@ if mode.startswith("Zukünftiges"):
                 if ps in missing and b365 in odds:
                     st.session_state[ps] = float(odds[b365])
 
+            # 3) Hinweise + Ursprungs-Quelle merken
             missing_b365 = any(x.startswith("B365") for x in missing)
             missing_ps   = any(x in ("PSH","PSD","PSA") for x in missing)
             if missing_b365 and not missing_ps:
@@ -264,12 +294,56 @@ if mode.startswith("Zukünftiges"):
         except Exception as e:
             st.error(f"Live-Quoten konnten nicht geladen werden: {e}")
 
+    # API-Diagnose: zeigt für DEIN aktuell gewähltes Match die Bookmaker,
+    # die die API wirklich liefert (gut, um Bet365/Pinnacle zu prüfen).
+    with st.expander("API-Diagnose: Bookmaker für dieses Match"):
+        try:
+            api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
+            if api_key:
+                url = "https://api.the-odds-api.com/v4/sports/soccer_germany_bundesliga/odds"
+                params = {
+                    "apiKey": api_key,
+                    "regions": "eu,uk,us",
+                    "oddsFormat": "decimal",
+                    "markets": "h2h",
+                    "bookmakers": "pinnacle,bet365",
+                    "_": int(time.time())  # immer frische Daten für die Diagnose
+                }
+                r = requests.get(url, params=params, timeout=12)
+                r.raise_for_status()
+                items = r.json()
+
+                def _any_match(user_set, ev_name):
+                    evn = _norm(ev_name)
+                    return evn in user_set or any(u in evn or evn in u for u in user_set)
+
+                nh, na = _alias_set(home_team), _alias_set(away_team)
+                matched = None
+                for ev in items:
+                    h = ev.get("home_team","")
+                    a = ev.get("away_team","")
+                    if (_any_match(nh,h) and _any_match(na,a)) or (_any_match(nh,a) and _any_match(na,h)):
+                        matched = ev
+                        break
+
+                if matched:
+                    st.write("Bookmaker im Event:",
+                             [bk.get("key","") for bk in matched.get("bookmakers", [])])
+                else:
+                    st.info("Kein passendes Event in der API (noch nicht gelistet oder Namensvariante).")
+            else:
+                st.info("Kein ODDS_API_KEY gesetzt.")
+        except Exception as e:
+            st.warning(f"Diagnose fehlgeschlagen: {e}")
+
+    # (Optional) Deine bestehende Liste aller API-Spiele kannst du darunter lassen
     with st.expander("Welche Spiele kennt die API gerade?"):
         try:
             api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
             if api_key:
                 url = "https://api.the-odds-api.com/v4/sports/soccer_germany_bundesliga/odds"
-                params = {"apiKey": api_key, "regions": "eu,uk", "oddsFormat": "decimal", "markets": "h2h", "bookmakers":"pinnacle,bet365"}
+                params = {"apiKey": api_key, "regions":"eu,uk,us",
+                          "oddsFormat":"decimal", "markets":"h2h"}
                 resp = requests.get(url, params=params, timeout=12)
                 resp.raise_for_status()
                 items = resp.json()
@@ -283,6 +357,7 @@ if mode.startswith("Zukünftiges"):
                 st.info("Kein ODDS_API_KEY gesetzt.")
         except Exception as e:
             st.warning(f"Listing fehlgeschlagen: {e}")
+
 
 # -------------------------
 # Historischer CSV-Lookup (nur im Historik-Modus)
@@ -452,3 +527,4 @@ if go:
 - **Historischer Modus:** holt **nur** damals gültige Quoten automatisch.
 - **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote, auf 100 % normiert (Overround entfernt).
 """)
+

@@ -3,15 +3,14 @@ import pandas as pd
 import joblib
 import numpy as np
 import altair as alt
-import os, requests, glob, re, unicodedata
-import time
+import os, requests, re, unicodedata
 from pathlib import Path
 
 # -------------------------------------------------
 # Seite konfigurieren
 # -------------------------------------------------
 st.set_page_config(page_title="Bundesliga Spielergebnis", page_icon="⚽", layout="centered")
-st.sidebar.success("Build: UI-Mode + CSV/LiveOdds")
+st.sidebar.success("Build: UI-Mode + CSV/LiveOdds (simple)")
 
 # -------------------------------------------------
 # Daten laden (historische CSVs für Quoten-Autofill)
@@ -28,12 +27,12 @@ def load_matches(paths):
         dfs.append(df)
     df_all = pd.concat(dfs, ignore_index=True)
 
-    # WICHTIG: Nur Teams sind Pflicht; Quoten dürfen fehlen
+    # Teams müssen vorhanden sein; Quoten dürfen fehlen
     keep_cols = [c for c in ["HomeTeam","AwayTeam"] if c in df_all.columns]
     if keep_cols:
         df_all = df_all.dropna(subset=keep_cols)
 
-    # Quoten ggf. sauber in float konvertieren
+    # Quoten in float konvertieren
     for col in ["B365H","B365D","B365A","PSH","PSD","PSA"]:
         if col in df_all.columns:
             df_all[col] = pd.to_numeric(df_all[col], errors="coerce")
@@ -96,22 +95,12 @@ def _alias_set(name: str) -> set:
     k = _norm(name)
     return set([k] + ALIASES.get(k, []))
 
-# 1) fetch_live_odds erlaubt optionalen Nonce
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=120)
 def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga",
-                    want_books=("pinnacle","bet365"), _nonce:int=0):
-    ...
-    # z. B. Regions etwas breiter:
-    params = {
-        "apiKey": api_key,
-        "regions": "eu,uk,us",     # etwas breiter, schadet nicht
-        "oddsFormat": "decimal",
-        "markets": "h2h",
-        "bookmakers": ",".join(want_books),
-        "_": _nonce                # nur für Cache-Key deiner App
-    }
-    ...
-
+                    want_books=("pinnacle","bet365")):
+    api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
+    if not api_key:
+        raise RuntimeError("ODDS_API_KEY fehlt. In Streamlit > Settings > Secrets eintragen.")
 
     nh, na = _alias_set(home_team), _alias_set(away_team)
 
@@ -126,8 +115,11 @@ def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga",
 
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
     params = {
-        "apiKey": api_key, "regions": "eu,uk", "oddsFormat": "decimal",
-        "markets": "h2h", "bookmakers": ",".join(want_books),
+        "apiKey": api_key,
+        "regions": "eu,uk,us",
+        "oddsFormat": "decimal",
+        "markets": "h2h",
+        "bookmakers": ",".join(want_books),
     }
     r = requests.get(url, params=params, timeout=12)
     r.raise_for_status()
@@ -145,7 +137,7 @@ def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga",
             break
 
     if not match:
-        raise LookupError("Kein passendes Event für diese Teams gefunden (evtl. kein anstehendes Spiel oder Namensvariante).")
+        raise LookupError("Kein passendes Event für diese Teams gefunden (noch nicht gelistet oder Namensvariante).")
 
     res = {}
     for bk in match.get("bookmakers", []):
@@ -181,7 +173,7 @@ def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga",
     return res, missing
 
 # -------------------------------------------------
-# Modell laden + Teamliste aus OneHotEncoder extrahieren
+# Modell laden + Teamliste
 # -------------------------------------------------
 model = joblib.load("bundesliga_best_model.joblib")
 try:
@@ -203,7 +195,7 @@ mode = st.radio(
     "Vorhersage-Modus",
     choices,
     index=0,
-    help="Historischer Modus holt nur bequem die damaligen Quoten. Die Vorhersage basiert IMMER auf einem Modell, das auf vielen vergangenen Jahren trainiert wurde."
+    help="Historischer Modus lädt bequem die damaligen Quoten. Die Vorhersage basiert IMMER auf einem Modell, das auf vielen vergangenen Jahren trainiert wurde."
 )
 
 # Trainingszeitraum anzeigen
@@ -214,8 +206,8 @@ if "Date" in df_all.columns and df_all["Date"].notna().any():
         train_span = f"Trainiert auf historischen Spielen ca. {dmin.date()} bis {dmax.date()}."
 st.info(
     "ℹ️ **Hinweis**\n\n"
-    "**Zukünftiges Spiel = echte Prognose:** Das Modell berechnet eine Vorhersage auf Basis der aktuell geladenen oder manuell eingegebenen Quoten.\n\n"
-    "**Historisches Spiel = Backtest:** Die damaligen Quoten werden geladen; das tatsächliche Ergebnis ist bereits bekannt – wir prüfen nur, wie gut das Modell **getroffen hätte** (keine Live-Prognose)."
+    "**Zukünftiges Spiel = echte Prognose:** Vorhersage basiert auf aktuell geladenen oder manuell eingegebenen Quoten.\n\n"
+    "**Historisches Spiel = Backtest:** Damalige Quoten laden; Ergebnis war bekannt – wir prüfen nur, wie gut das Modell getroffen **hätte**."
     + (f"\n\n{train_span}" if train_span else "")
 )
 
@@ -242,31 +234,20 @@ with colB:
 # Live-Quoten (nur im Zukunfts-Modus)
 # -------------------------
 if mode.startswith("Zukünftiges"):
-
-    # Zwei Buttons: normal und "Cache ignorieren"
-    c1, c2 = st.columns(2)
-    with c1:
-        refresh = st.button("🔄 Live-Quoten laden (Bet365 & Pinnacle)")
-    with c2:
-        hard_refresh = st.button("⟳ Live-Quoten (Cache ignorieren)")
-
-    if refresh or hard_refresh:
+    if st.button("🔄 Live-Quoten laden (Bet365 & Pinnacle)"):
         try:
-            # Cache-Buster (nur beim harten Refresh)
-            nonce = int(time.time()) if hard_refresh else 0
-
-            odds, missing = fetch_live_odds(home_team, away_team, _nonce=nonce)
+            odds, missing = fetch_live_odds(home_team, away_team)
 
             # Reset Hinweise
             st.session_state["odds_note"] = ""
             st.session_state["odds_source_hint"] = None
             st.session_state["odds_origin"] = None
 
-            # 1) Gelieferte Werte setzen
+            # Gelieferte Werte setzen
             for k, v in odds.items():
                 st.session_state[k] = float(v)
 
-            # 2) Fallback spiegeln
+            # Fallback spiegeln
             for b365, ps in [("B365H","PSH"), ("B365D","PSD"), ("B365A","PSA")]:
                 if b365 in missing and ps in odds:
                     st.session_state[b365] = float(odds[ps])
@@ -274,7 +255,7 @@ if mode.startswith("Zukünftiges"):
                 if ps in missing and b365 in odds:
                     st.session_state[ps] = float(odds[b365])
 
-            # 3) Hinweise + Ursprungs-Quelle merken
+            # Hinweise + Ursprungs-Quelle
             missing_b365 = any(x.startswith("B365") for x in missing)
             missing_ps   = any(x in ("PSH","PSD","PSA") for x in missing)
             if missing_b365 and not missing_ps:
@@ -293,71 +274,6 @@ if mode.startswith("Zukünftiges"):
                 st.success("Live-Quoten geladen.")
         except Exception as e:
             st.error(f"Live-Quoten konnten nicht geladen werden: {e}")
-
-    # API-Diagnose: zeigt für DEIN aktuell gewähltes Match die Bookmaker,
-    # die die API wirklich liefert (gut, um Bet365/Pinnacle zu prüfen).
-    with st.expander("API-Diagnose: Bookmaker für dieses Match"):
-        try:
-            api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
-            if api_key:
-                url = "https://api.the-odds-api.com/v4/sports/soccer_germany_bundesliga/odds"
-                params = {
-                    "apiKey": api_key,
-                    "regions": "eu,uk,us",
-                    "oddsFormat": "decimal",
-                    "markets": "h2h",
-                    "bookmakers": "pinnacle,bet365",
-                    "_": int(time.time())  # immer frische Daten für die Diagnose
-                }
-                r = requests.get(url, params=params, timeout=12)
-                r.raise_for_status()
-                items = r.json()
-
-                def _any_match(user_set, ev_name):
-                    evn = _norm(ev_name)
-                    return evn in user_set or any(u in evn or evn in u for u in user_set)
-
-                nh, na = _alias_set(home_team), _alias_set(away_team)
-                matched = None
-                for ev in items:
-                    h = ev.get("home_team","")
-                    a = ev.get("away_team","")
-                    if (_any_match(nh,h) and _any_match(na,a)) or (_any_match(nh,a) and _any_match(na,h)):
-                        matched = ev
-                        break
-
-                if matched:
-                    st.write("Bookmaker im Event:",
-                             [bk.get("key","") for bk in matched.get("bookmakers", [])])
-                else:
-                    st.info("Kein passendes Event in der API (noch nicht gelistet oder Namensvariante).")
-            else:
-                st.info("Kein ODDS_API_KEY gesetzt.")
-        except Exception as e:
-            st.warning(f"Diagnose fehlgeschlagen: {e}")
-
-    # (Optional) Deine bestehende Liste aller API-Spiele kannst du darunter lassen
-    with st.expander("Welche Spiele kennt die API gerade?"):
-        try:
-            api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
-            if api_key:
-                url = "https://api.the-odds-api.com/v4/sports/soccer_germany_bundesliga/odds"
-                params = {"apiKey": api_key, "regions":"eu,uk,us",
-                          "oddsFormat":"decimal", "markets":"h2h"}
-                resp = requests.get(url, params=params, timeout=12)
-                resp.raise_for_status()
-                items = resp.json()
-                rows = []
-                for it in items:
-                    h = it.get("home_team") or (it.get("teams",[None,None])[0] if it.get("teams") else None)
-                    a = it.get("away_team") or (it.get("teams",[None,None])[1] if it.get("teams") else None)
-                    rows.append(f"{h} vs {a} — {it.get('commence_time','')}")
-                st.write(rows or "Keine kommenden Bundesliga-Spiele gefunden.")
-            else:
-                st.info("Kein ODDS_API_KEY gesetzt.")
-        except Exception as e:
-            st.warning(f"Listing fehlgeschlagen: {e}")
-
 
 # -------------------------
 # Historischer CSV-Lookup (nur im Historik-Modus)
@@ -394,19 +310,25 @@ st.caption("Niedrigere Quote = höhere implizite Wahrscheinlichkeit. Unten entfe
 
 c1, c2, c3 = st.columns(3)
 with c1:
-    B365H = st.number_input("B365H (Heimsieg)", value=float(st.session_state.get("B365H", 1.80)), step=0.01, key="B365H")
+    B365H = st.number_input("B365H (Heimsieg)",
+        value=float(st.session_state.get("B365H", 1.80)), step=0.01, key="B365H")
 with c2:
-    B365D = st.number_input("B365D (Unentschieden)", value=float(st.session_state.get("B365D", 3.60)), step=0.01, key="B365D")
+    B365D = st.number_input("B365D (Unentschieden)",
+        value=float(st.session_state.get("B365D", 3.60)), step=0.01, key="B365D")
 with c3:
-    B365A = st.number_input("B365A (Auswärtssieg)", value=float(st.session_state.get("B365A", 4.20)), step=0.01, key="B365A")
+    B365A = st.number_input("B365A (Auswärtssieg)",
+        value=float(st.session_state.get("B365A", 4.20)), step=0.01, key="B365A")
 
 c4, c5, c6 = st.columns(3)
 with c4:
-    PSH = st.number_input("PSH (Heimsieg)", value=float(st.session_state.get("PSH", 1.85)), step=0.01, key="PSH")
+    PSH = st.number_input("PSH (Heimsieg)",
+        value=float(st.session_state.get("PSH", 1.85)), step=0.01, key="PSH")
 with c5:
-    PSD = st.number_input("PSD (Unentschieden)", value=float(st.session_state.get("PSD", 3.50)), step=0.01, key="PSD")
+    PSD = st.number_input("PSD (Unentschieden)",
+        value=float(st.session_state.get("PSD", 3.50)), step=0.01, key="PSD")
 with c6:
-    PSA = st.number_input("PSA (Auswärtssieg)", value=float(st.session_state.get("PSA", 4.00)), step=0.01, key="PSA")
+    PSA = st.number_input("PSA (Auswärtssieg)",
+        value=float(st.session_state.get("PSA", 4.00)), step=0.01, key="PSA")
 
 # -------------------------------------------------
 # Debug: Eingabe prüfen
@@ -454,8 +376,8 @@ if go:
     st.success(f"**Vorhersage:** {label_map.get(pred, pred)}")
 
     st.caption(
-        "Die Balken sind **Modell-Wahrscheinlichkeiten** aus dem trainierten ML-Modell. "
-        "Die Tabelle unten zeigt **faire Buchmacher-Wahrscheinlichkeiten** (1/Quote, auf 100 % normiert) – "
+        "Die Balken sind **Modell-Wahrscheinlichkeiten** (ML). "
+        "Die Tabelle unten sind **faire Buchmacher-Wahrscheinlichkeiten** (1/Quote, auf 100 % normiert) – "
         "rein mathematisch, **kein** ML-Output."
     )
 
@@ -483,23 +405,30 @@ if go:
     st.altair_chart(chart, use_container_width=True)
     st.caption("Hinweis: Die Klassenreihenfolge entspricht der Reihenfolge im Training (`model.classes_`).")
 
+    # Faire Wahrscheinlichkeiten – Quelle korrekt labeln (inkl. gespiegelt)
     origin = st.session_state.get("odds_origin")  # "PS", "B365" oder None
-
     def pick_values_and_label():
         if origin == "PS":
-            return (PSH, PSD, PSA, "Pinnacle (PS) (gespiegelt)")
+            return (st.session_state.get("PSH", np.nan),
+                    st.session_state.get("PSD", np.nan),
+                    st.session_state.get("PSA", np.nan),
+                    "Pinnacle (PS) (gespiegelt)")
         if origin == "B365":
-            return (B365H, B365D, B365A, "Bet365 (gespiegelt)")
+            return (st.session_state.get("B365H", np.nan),
+                    st.session_state.get("B365D", np.nan),
+                    st.session_state.get("B365A", np.nan),
+                    "Bet365 (gespiegelt)")
         has_b365 = all(x in st.session_state and st.session_state[x] for x in ("B365H","B365D","B365A"))
         has_ps   = all(x in st.session_state and st.session_state[x] for x in ("PSH","PSD","PSA"))
         if has_b365:
-            return (B365H, B365D, B365A, "Bet365")
+            return (st.session_state["B365H"], st.session_state["B365D"], st.session_state["B365A"], "Bet365")
         if has_ps:
-            return (PSH, PSD, PSA, "Pinnacle (PS)")
+            return (st.session_state["PSH"], st.session_state["PSD"], st.session_state["PSA"], "Pinnacle (PS)")
+        # Fallback (gemischt / manuell)
         h_q = st.session_state.get("B365H", st.session_state.get("PSH", B365H))
         d_q = st.session_state.get("B365D", st.session_state.get("PSD", B365D))
         a_q = st.session_state.get("B365A", st.session_state.get("PSA", B365A))
-        label = st.session_state.get("odds_source_hint") or "Quelle (gemischt)"
+        label = st.session_state.get("odds_source_hint") or "Quelle (gemischt / manuell)"
         return (h_q, d_q, a_q, label)
 
     h_q, d_q, a_q, quoten_label = pick_values_and_label()
@@ -522,10 +451,8 @@ if go:
 
     with st.expander("🧠 Wie funktioniert die Vorhersage?"):
         st.markdown("""
-- **Training:** auf vielen historischen Spielen (Teams → One-Hot, Quoten, abgeleitete Merkmale).
-- **Vorhersage:** nutzt **nur** die aktuell eingegebenen Teams & Quoten, nicht das Datum.
-- **Historischer Modus:** holt **nur** damals gültige Quoten automatisch.
-- **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote, auf 100 % normiert (Overround entfernt).
+- **Training:** viele historische Spiele (Teams → One-Hot, Quoten, abgeleitete Features).
+- **Vorhersage:** nutzt **nur** die aktuell eingegebenen/geladenen Quoten.
+- **Historischer Modus:** lädt **nur** die damaligen Quoten (Backtest).
+- **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote (Overround entfernt).
 """)
-
-

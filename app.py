@@ -83,6 +83,8 @@ ALIASES = {
     "st pauli": ["st pauli", "fc st pauli"],
     "fortuna dusseldorf": ["fortuna dusseldorf", "fortuna"],
     "hamburger sv": ["hamburger sv", "hamburg"],
+    "ein frankfurt": ["ein frankfurt", "eintracht frankfurt", "frankfurt"],
+
 }
 def _alias_set(name: str) -> set:
     k = _norm(name)
@@ -474,4 +476,5 @@ if go:
 - **Historischer Modus:** holt **nur** damals gültige Quoten automatisch.
 - **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote, auf 100 % normiert (Overround entfernt).
 """)
+
 

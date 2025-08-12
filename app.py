@@ -84,7 +84,6 @@ ALIASES = {
     "fortuna dusseldorf": ["fortuna dusseldorf", "fortuna"],
     "hamburger sv": ["hamburger sv", "hamburg"],
 }
-
 def _alias_set(name: str) -> set:
     k = _norm(name)
     return set([k] + ALIASES.get(k, []))
@@ -114,12 +113,10 @@ def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga",
     for ev in data:
         ev_home = _norm(ev.get("home_team", ""))
         ev_away = _norm(ev.get("away_team", ""))
-
         if (ev_home in nh and ev_away in na) or (ev_home in na and ev_away in nh):
             match = ev
             flip = (ev_home in na and ev_away in nh)
             break
-
     if not match:
         raise LookupError("Kein passendes Event für diese Teams gefunden (evtl. kein anstehendes Spiel oder Namensvariante).")
 
@@ -132,12 +129,10 @@ def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga",
             if m.get("key") != "h2h":
                 continue
             for out in m.get("outcomes", []):
-                nm_raw = out.get("name","")
-                nm = _norm(nm_raw)
+                nm = _norm(out.get("name",""))
                 price = float(out.get("price"))
                 code = None
-
-                if nm in ("draw", "unentschieden"):
+                if nm in ("draw","unentschieden"):
                     code = "D"
                 elif nm in nh:
                     code = "H"
@@ -147,10 +142,8 @@ def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga",
                     code = "A" if flip else "H"
                 elif nm in ("away","auswaerts","auswarts","gast","away team"):
                     code = "H" if flip else "A"
-
                 if not code:
                     continue
-
                 if "pinnacle" in bname:
                     res[f"PS{code}"] = price
                 elif "bet365" in bname:
@@ -164,10 +157,8 @@ def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga",
 # Modell laden + Teamliste aus OneHotEncoder extrahieren
 # -------------------------------------------------
 model = joblib.load("bundesliga_best_model.joblib")
-
 try:
     ohe = model.named_steps["preprocess"].named_transformers_["cat"]
-    # Reihenfolge entspricht ["HomeTeam","AwayTeam"]
     home_teams = list(ohe.categories_[0])
     away_teams = list(ohe.categories_[1])
     teams = sorted(set(home_teams) | set(away_teams))
@@ -188,14 +179,12 @@ mode = st.radio(
     help="Historischer Modus holt nur bequem die damaligen Quoten. Die Vorhersage basiert IMMER auf einem Modell, das auf vielen vergangenen Jahren trainiert wurde."
 )
 
-# Trainingszeitraum aus CSVs anzeigen (nur als Info)
+# Trainingszeitraum aus CSVs anzeigen
 train_span = ""
 if "Date" in df_all.columns and df_all["Date"].notna().any():
-    dmin = df_all["Date"].min()
-    dmax = df_all["Date"].max()
+    dmin, dmax = df_all["Date"].min(), df_all["Date"].max()
     if pd.notna(dmin) and pd.notna(dmax):
         train_span = f"Trainiert auf historischen Spielen ca. {dmin.date()} bis {dmax.date()}."
-
 st.info(
     "ℹ️ **Wichtig:** Die Vorhersage kommt aus einem **trainierten ML-Modell** "
     "(Logistic Regression oder Random Forest). "
@@ -207,26 +196,18 @@ st.info(
 # Eingaben (Teams)
 # -------------------------
 colA, colB = st.columns(2)
-
 with colA:
     if teams:
-        home_team = st.selectbox(
-            "Heimmannschaft",
-            teams,
-            index=teams.index("Bayern Munich") if "Bayern Munich" in teams else 0,
-            key="home_team_select"
-        )
+        home_team = st.selectbox("Heimmannschaft", teams,
+                                 index=teams.index("Bayern Munich") if "Bayern Munich" in teams else 0,
+                                 key="home_team_select")
     else:
         home_team = st.text_input("Heimmannschaft", "Bayern Munich")
-
 with colB:
     if teams:
-        away_team = st.selectbox(
-            "Auswärtsmannschaft",
-            teams,
-            index=teams.index("Borussia Dortmund") if "Borussia Dortmund" in teams else 0,
-            key="away_team_select"
-        )
+        away_team = st.selectbox("Auswärtsmannschaft", teams,
+                                 index=teams.index("Borussia Dortmund") if "Borussia Dortmund" in teams else 0,
+                                 key="away_team_select")
     else:
         away_team = st.text_input("Auswärtsmannschaft", "Borussia Dortmund")
 
@@ -234,20 +215,40 @@ with colB:
 # Live-Quoten (nur im Zukunfts-Modus)
 # -------------------------
 if mode.startswith("Zukünftiges"):
-    # Button: Live-Quoten laden
     if st.button("🔄 Live-Quoten laden (Bet365 & Pinnacle)"):
         try:
             odds, missing = fetch_live_odds(home_team, away_team)
+            # Reset Hinweis
+            st.session_state["odds_note"] = ""
+            st.session_state["odds_source_hint"] = None
+            # 1) Gelieferte Werte setzen
             for k, v in odds.items():
                 st.session_state[k] = float(v)
-            if missing:
-                st.warning("Nicht alle Quoten verfügbar: " + ", ".join(missing))
+            # 2) Fallback spiegeln
+            for b365, ps in [("B365H","PSH"), ("B365D","PSD"), ("B365A","PSA")]:
+                if b365 in missing and ps in odds:
+                    st.session_state[b365] = float(odds[ps])
+            for ps, b365 in [("PSH","B365H"), ("PSD","B365D"), ("PSA","B365A")]:
+                if ps in missing and b365 in odds:
+                    st.session_state[ps] = float(odds[b365])
+            # 3) Hinweise
+            missing_b365 = any(x.startswith("B365") for x in missing)
+            missing_ps   = any(x in ("PSH","PSD","PSA") for x in missing)
+            if missing_b365 and not missing_ps:
+                st.session_state["odds_note"] = "Bet365-Quoten fehlten – Pinnacle wurde gespiegelt."
+                st.session_state["odds_source_hint"] = "Pinnacle (PS)"
+                st.info(st.session_state["odds_note"])
+            elif missing_ps and not missing_b365:
+                st.session_state["odds_note"] = "Pinnacle-Quoten fehlten – Bet365 wurde gespiegelt."
+                st.session_state["odds_source_hint"] = "Bet365"
+                st.info(st.session_state["odds_note"])
+            elif missing_b365 and missing_ps:
+                st.warning("Von keinem Buchmacher lagen vollständige Quoten vor – bitte manuell prüfen.")
             else:
                 st.success("Live-Quoten geladen.")
         except Exception as e:
             st.error(f"Live-Quoten konnten nicht geladen werden: {e}")
 
-    # Optional: aktuell verfügbare Spiele anzeigen
     with st.expander("Welche Spiele kennt die API gerade?"):
         try:
             api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
@@ -274,7 +275,6 @@ if mode.startswith("Zukünftiges"):
 if mode == "Historisches Spiel (Quoten aus CSV)":
     cands = df_all[(df_all["HomeTeam"] == home_team) & (df_all["AwayTeam"] == away_team)].copy()
     selected_row = None
-
     if not cands.empty:
         if "Date" in cands.columns and cands["Date"].notna().any():
             cands = cands.sort_values("Date", ascending=False)
@@ -283,7 +283,6 @@ if mode == "Historisches Spiel (Quoten aus CSV)":
             selected_row = cands.iloc[date_choices.index(picked_date)]
         else:
             selected_row = cands.iloc[0]
-
         if st.button("🔁 Quoten aus CSV übernehmen"):
             for k in ["B365H","B365D","B365A","PSH","PSD","PSA"]:
                 if k in selected_row and not pd.isna(selected_row[k]):
@@ -339,17 +338,14 @@ with st.expander("🔎 Debug: Eingabe-Features ansehen"):
 # Helper-Funktionen
 # -------------------------------------------------
 def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
-    # exakt wie im Notebook erzeugt:
     df["B365_HminusA"] = df["B365H"] - df["B365A"]
     df["PS_HminusA"]   = df["PSH"]  - df["PSA"]
     df["Draw_avg"]     = 0.5 * (df["B365D"].astype(float) + df["PSD"].astype(float))
     return df
 
 def implied_probs_from_odds(h, d, a):
-    # rohe inverse Quoten
     pH, pD, pA = 1.0/h, 1.0/d, 1.0/a
     overround = pH + pD + pA
-    # Normalisieren (Buchmacher-Marge entfernen)
     return pH/overround, pD/overround, pA/overround, overround
 
 # -------------------------------------------------
@@ -358,7 +354,6 @@ def implied_probs_from_odds(h, d, a):
 go = st.button("Vorhersage starten", type="primary")
 
 if go:
-    # Input-DF
     sample = pd.DataFrame([{
         "HomeTeam": home_team,
         "AwayTeam": away_team,
@@ -367,25 +362,20 @@ if go:
     }])
     sample = add_derived_features(sample)
 
-    # Modell-Prediction
     pred = model.predict(sample)[0]
     proba = model.predict_proba(sample)[0]
-    classes = list(model.classes_)  # z. B. ["A","D","H"] – Reihenfolge beachten!
+    classes = list(model.classes_)
 
-    # Ausgabe
     label_map = {"H": "Heimsieg (H)", "D": "Unentschieden (D)", "A": "Auswärtssieg (A)"}
     st.success(f"**Vorhersage:** {label_map.get(pred, pred)}")
 
-    # Kontext zur Vorhersage
     st.caption(
-        "Die Balken sind **Modell-Wahrscheinlichkeiten** aus dem trainierten ML-Modell "
-        "(Muster aus vielen vergangenen Spielen: Teams als One-Hot + Quoten + abgeleitete Features). "
+        "Die Balken sind **Modell-Wahrscheinlichkeiten** aus dem trainierten ML-Modell. "
         "Die Tabelle unten zeigt **faire Buchmacher-Wahrscheinlichkeiten** (1/Quote, auf 100 % normiert) – "
         "rein mathematisch, **kein** ML-Output."
     )
 
-    # Balkendiagramm
-    color_map = {"H": "#2ecc71", "D": "#f1c40f", "A": "#e74c3c"}  # grün, gelb, rot
+    color_map = {"H": "#2ecc71", "D": "#f1c40f", "A": "#e74c3c"}
     df_plot = pd.DataFrame({
         "Klasse": [label_map.get(c, c) for c in classes],
         "Code": classes,
@@ -409,24 +399,37 @@ if go:
     st.altair_chart(chart, use_container_width=True)
     st.caption("Hinweis: Die Klassenreihenfolge entspricht der Reihenfolge im Training (`model.classes_`).")
 
-    # Quoten -> faire Wahrscheinlichkeiten (Beispielhaft mit B365)
-    st.subheader("Quoten → (faire) Wahrscheinlichkeiten")
-    pH, pD, pA, overround = implied_probs_from_odds(B365H, B365D, B365A)
+    # Quelle für faire Wahrscheinlichkeiten bestimmen
+    use_b365 = all(x in st.session_state and st.session_state[x] for x in ("B365H","B365D","B365A"))
+    use_ps   = all(x in st.session_state and st.session_state[x] for x in ("PSH","PSD","PSA"))
+    if use_b365:
+        h_q, d_q, a_q = B365H, B365D, B365A
+        quoten_label = "Bet365"
+    elif use_ps:
+        h_q, d_q, a_q = PSH, PSD, PSA
+        quoten_label = "Pinnacle (PS)"
+    else:
+        h_q = st.session_state.get("B365H", st.session_state.get("PSH", B365H))
+        d_q = st.session_state.get("B365D", st.session_state.get("PSD", B365D))
+        a_q = st.session_state.get("B365A", st.session_state.get("PSA", B365A))
+        quoten_label = st.session_state.get("odds_source_hint") or "gemischte Quelle"
+
+    st.subheader(f"Quoten → (faire) Wahrscheinlichkeiten – {quoten_label}")
+    pH, pD, pA, overround = implied_probs_from_odds(h_q, d_q, a_q)
     tbl = pd.DataFrame({
         "Ereignis": ["Heimsieg (H)", "Unentschieden (D)", "Auswärtssieg (A)"],
-        "Quote (B365)": [B365H, B365D, B365A],
-        "Implied p (unnormiert)": [1/B365H, 1/B365D, 1/B365A],
+        f"Quote ({quoten_label})": [h_q, d_q, a_q],
+        "Implied p (unnormiert)": [1/h_q, 1/d_q, 1/a_q],
         "Faire p (normiert)": [pH, pD, pA]
     })
     st.table(tbl.style.format({
-        "Quote (B365)": "{:.2f}",
+        f"Quote ({quoten_label})": "{:.2f}",
         "Implied p (unnormiert)": "{:.3f}",
         "Faire p (normiert)": "{:.3f}"
     }))
     st.caption(f"Overround (Summe der inversen Quoten) = {overround:.3f}. "
                "Je größer >1, desto höher die Buchmachermarge. Wir normalisieren auf Summe=1.")
 
-    # Edu-Expander
     with st.expander("🧠 Wie funktioniert die Vorhersage?"):
         st.markdown("""
 - **Training:** auf vielen historischen Spielen (Teams → One-Hot, Quoten, abgeleitete Merkmale).

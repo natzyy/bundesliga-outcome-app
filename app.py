@@ -186,9 +186,10 @@ if "Date" in df_all.columns and df_all["Date"].notna().any():
     if pd.notna(dmin) and pd.notna(dmax):
         train_span = f"Trainiert auf historischen Spielen ca. {dmin.date()} bis {dmax.date()}."
 st.info(
-    "ℹ️ **Wichtig:** Die Vorhersage kommt aus einem **trainierten ML-Modell** "
-    "(Logistic Regression oder Random Forest). "
-    "Der **historische Modus** dient nur dazu, die damaligen **Quoten automatisch** zu übernehmen. "
+    "ℹ️ **Hinweis**\n\n"
+    "**Zukünftiges Spiel:** echte Prognose auf Basis der aktuell eingegebenen/geladenen Quoten.\n"
+    "**Historischer Modus (Backtest):** lädt die damaligen Quoten; das Ergebnis ist bereits bekannt – "
+    "wir prüfen nur, wie gut das Modell getroffen **hätte** (keine Live-Prognose)."
     + (f"\n\n{train_span}" if train_span else "")
 )
 
@@ -437,3 +438,4 @@ if go:
 - **Historischer Modus:** holt **nur** damals gültige Quoten automatisch.
 - **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote, auf 100 % normiert (Overround entfernt).
 """)
+

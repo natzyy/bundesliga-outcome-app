@@ -9,6 +9,8 @@ from pathlib import Path
 # Seite konfigurieren
 # -------------------------------------------------
 st.set_page_config(page_title="Bundesliga Spielergebnis", page_icon="⚽", layout="centered")
+st.sidebar.success("Build: 12-08 23:59 — MODE-UI")
+
 # --- DEBUG: zeigt, ob die CSVs da sind ---
 import os, glob
 VERSION = "UI-Mode + CSV debug"
@@ -290,4 +292,5 @@ if go:
 - **Historischer Modus:** holt **nur** damals gültige Quoten automatisch.
 - **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote, auf 100 % normiert (Overround entfernt).
 """)
+
 

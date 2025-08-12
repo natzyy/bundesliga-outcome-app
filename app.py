@@ -469,13 +469,30 @@ if go:
     st.caption(f"Overround {quoten_label}: {overround:.3f}. "
                "Je größer >1, desto höher die Buchmachermarge. Wir normalisieren auf Summe=1.")
 
-    with st.expander("🧠 Wie funktioniert die Vorhersage?"):
-        st.markdown("""
-- **Training:** auf vielen historischen Spielen (Teams → One-Hot, Quoten, abgeleitete Merkmale).
-- **Vorhersage:** nutzt **nur** die aktuell eingegebenen Teams & Quoten, nicht das Datum.
-- **Historischer Modus:** holt **nur** damals gültige Quoten automatisch.
-- **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote, auf 100 % normiert (Overround entfernt).
+with st.expander("🧠 Wie funktioniert die Vorhersage?"):
+    st.markdown("""
+**Kurz gesagt:** Das Modell nutzt Teams + Quoten und gibt **Wahrscheinlichkeiten** für H/D/A aus.  
+Die Tabelle zeigt **faire** (margenbereinigte) Buchmacher-Prozente als Vergleich.
+
+**Training**
+- Auf vielen historischen Bundesliga-Spielen (Teams als One-Hot, Quoten von Bet365 & Pinnacle, abgeleitete Features).
+
+**Modi**
+- **Zukünftiges Spiel = echte Prognose:** Aktuelle oder manuell eingegebene Quoten → Modell berechnet Wahrscheinlichkeiten.
+- **Historisches Spiel = Backtest:** Damalige Quoten werden geladen; das echte Ergebnis war bekannt. Wir prüfen nur, wie gut das Modell **getroffen hätte**.
+
+**Anzeige verstehen**
+- **Banner** = wahrscheinlichste Klasse (H/D/A).
+- **Balken** = **Modell-Wahrscheinlichkeiten** (Output des ML-Modells).
+- **Tabelle** = „faire“ Buchmacher-Wahrscheinlichkeiten aus **einem** Buchmacher (Bet365 **oder** Pinnacle), Marge entfernt (**Overround**).
+- **„(gespiegelt)“** heißt: fehlende Quoten eines Buchmachers wurden mit der anderen Quelle ergänzt (nur für konsistente Eingaben).
+
+**Grenzen**
+- Unentschieden ist generell schwerer zu treffen.
+- Keine Live-Faktoren wie Verletzungen, Form, Wetter etc. im Modell.
 """)
+
+
 
 
 

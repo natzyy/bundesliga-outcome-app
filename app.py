@@ -167,10 +167,11 @@ st.info(
     + (f"\n\n{train_span}" if train_span else "")
 )
 
-# -------------------------------------------------
-# Eingaben: Teams
-# -------------------------------------------------
+# -------------------------
+# Eingaben (Teams)
+# -------------------------
 colA, colB = st.columns(2)
+
 with colA:
     if teams:
         home_team = st.selectbox(
@@ -183,7 +184,19 @@ with colA:
         home_team = st.text_input("Heimmannschaft", "Bayern Munich")
 
 with colB:
-    # --- Live-Quoten nur im Zukunftsmodus laden ---
+    if teams:
+        away_team = st.selectbox(
+            "Auswärtsmannschaft",
+            teams,
+            index=teams.index("Borussia Dortmund") if "Borussia Dortmund" in teams else 0,
+            key="away_team_select"
+        )
+    else:
+        away_team = st.text_input("Auswärtsmannschaft", "Borussia Dortmund")
+
+# -------------------------
+# Live-Quoten (nur im Zukunfts-Modus)
+# -------------------------
 if mode.startswith("Zukünftiges"):
     if st.button("🔄 Live-Quoten laden (Bet365 & Pinnacle)"):
         try:
@@ -197,19 +210,9 @@ if mode.startswith("Zukünftiges"):
         except Exception as e:
             st.error(f"Live-Quoten konnten nicht geladen werden: {e}")
 
-    if teams:
-        away_team = st.selectbox(
-            "Auswärtsmannschaft",
-            teams,
-            index=teams.index("Borussia Dortmund") if "Borussia Dortmund" in teams else 0,
-            key="away_team_select"
-        )
-    else:
-        away_team = st.text_input("Auswärtsmannschaft", "Borussia Dortmund")
-
-# -------------------------------------------------
-# Historischer Quoten-Lookup (nur im historischen Modus)
-# -------------------------------------------------
+# -------------------------
+# Historischer CSV-Lookup (nur im Historik-Modus)
+# -------------------------
 if mode == "Historisches Spiel (Quoten aus CSV)":
     cands = df_all[(df_all["HomeTeam"] == home_team) & (df_all["AwayTeam"] == away_team)].copy()
     selected_row = None
@@ -230,6 +233,7 @@ if mode == "Historisches Spiel (Quoten aus CSV)":
             st.toast("Quoten aus CSV übernommen.", icon="✅")
     else:
         st.info("Kein historisches Spiel mit Quoten für diese Heim-/Auswärts-Kombination gefunden.")
+
 
 # -------------------------------------------------
 # Eingaben: Quoten (manuell oder via CSV-Autofill)
@@ -373,6 +377,7 @@ if go:
 - **Historischer Modus:** holt **nur** damals gültige Quoten automatisch.
 - **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote, auf 100 % normiert (Overround entfernt).
 """)
+
 
 
 

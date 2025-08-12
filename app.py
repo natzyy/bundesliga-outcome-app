@@ -27,9 +27,15 @@ def load_matches(paths):
         dfs.append(df)
     df_all = pd.concat(dfs, ignore_index=True)
 
-    # nur Zeilen mit kompletten Quoten behalten
-    req = ["HomeTeam","AwayTeam","B365H","B365D","B365A","PSH","PSD","PSA"]
-    df_all = df_all.dropna(subset=[c for c in req if c in df_all.columns])
+    # WICHTIG: Nur Teams sind Pflicht; Quoten dürfen fehlen
+    keep_cols = [c for c in ["HomeTeam","AwayTeam"] if c in df_all.columns]
+    if keep_cols:
+        df_all = df_all.dropna(subset=keep_cols)
+
+    # Quoten ggf. sauber in float konvertieren
+    for col in ["B365H","B365D","B365A","PSH","PSD","PSA"]:
+        if col in df_all.columns:
+            df_all[col] = pd.to_numeric(df_all[col], errors="coerce")
 
     # Datum parsen (falls vorhanden)
     if "Date" in df_all.columns:
@@ -84,7 +90,6 @@ ALIASES = {
     "fortuna dusseldorf": ["fortuna dusseldorf", "fortuna"],
     "hamburger sv": ["hamburger sv", "hamburg"],
     "ein frankfurt": ["ein frankfurt", "eintracht frankfurt", "frankfurt"],
-
 }
 def _alias_set(name: str) -> set:
     k = _norm(name)
@@ -98,13 +103,10 @@ def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga",
 
     nh, na = _alias_set(home_team), _alias_set(away_team)
 
-    # --- neuer Helfer: robustes Matching (auch Teilstrings) ---
     def _any_match(user_set: set, ev_name: str) -> bool:
-        """Matcht auch Teilstrings: 'ein frankfurt' ~ 'eintracht frankfurt'."""
         evn = _norm(ev_name)
         if evn in user_set:
             return True
-        # Teilstring / Token-Overlap
         for u in user_set:
             if u in evn or evn in u:
                 return True
@@ -112,33 +114,27 @@ def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga",
 
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
     params = {
-        "apiKey": api_key,
-        "regions": "eu,uk",
-        "oddsFormat": "decimal",
-        "markets": "h2h",
-        "bookmakers": ",".join(want_books),
+        "apiKey": api_key, "regions": "eu,uk", "oddsFormat": "decimal",
+        "markets": "h2h", "bookmakers": ",".join(want_books),
     }
     r = requests.get(url, params=params, timeout=12)
     r.raise_for_status()
-    data = r.json()  # v4: list of events with home_team / away_team
+    data = r.json()
 
-    # --- ERSETZTER MATCH-LOOP: nutzt _any_match und setzt flip korrekt ---
     match = None
-    flip = False  # falls API-Home != User-Home
+    flip = False
     for ev in data:
         ev_home_raw = ev.get("home_team", "")
         ev_away_raw = ev.get("away_team", "")
         if (_any_match(nh, ev_home_raw) and _any_match(na, ev_away_raw)) or \
            (_any_match(nh, ev_away_raw) and _any_match(na, ev_home_raw)):
             match = ev
-            # Flip, wenn API-Home eigentlich unser Auswärts ist
             flip = (_any_match(nh, ev_away_raw) and _any_match(na, ev_home_raw))
             break
 
     if not match:
         raise LookupError("Kein passendes Event für diese Teams gefunden (evtl. kein anstehendes Spiel oder Namensvariante).")
 
-    # Quoten extrahieren
     res = {}
     for bk in match.get("bookmakers", []):
         bname = (bk.get("key","") or "").lower()
@@ -182,7 +178,7 @@ try:
     away_teams = list(ohe.categories_[1])
     teams = sorted(set(home_teams) | set(away_teams))
 except Exception:
-    teams = None  # Fallback auf Freitext
+    teams = None  # Fallback
 
 # -------------------------------------------------
 # UI: Titel + Moduswahl
@@ -190,7 +186,7 @@ except Exception:
 st.title("⚽ Bundesliga Spielergebnis – Vorhersage")
 
 has_history = not df_all.empty
-choices = ["Zukünftiges Spiel "] + (["Historisches Spiel "] if has_history else [])
+choices = ["Zukünftiges Spiel (manuelle Quoten)"] + (["Historisches Spiel (Quoten aus CSV)"] if has_history else [])
 mode = st.radio(
     "Vorhersage-Modus",
     choices,
@@ -198,7 +194,7 @@ mode = st.radio(
     help="Historischer Modus holt nur bequem die damaligen Quoten. Die Vorhersage basiert IMMER auf einem Modell, das auf vielen vergangenen Jahren trainiert wurde."
 )
 
-# Trainingszeitraum aus CSVs anzeigen
+# Trainingszeitraum anzeigen
 train_span = ""
 if "Date" in df_all.columns and df_all["Date"].notna().any():
     dmin, dmax = df_all["Date"].min(), df_all["Date"].max()
@@ -237,16 +233,11 @@ if mode.startswith("Zukünftiges"):
     if st.button("🔄 Live-Quoten laden (Bet365 & Pinnacle)"):
         try:
             odds, missing = fetch_live_odds(home_team, away_team)
-            # Reset Hinweise
             st.session_state["odds_note"] = ""
             st.session_state["odds_source_hint"] = None
             st.session_state["odds_origin"] = None
-
-            # 1) Gelieferte Werte setzen
             for k, v in odds.items():
                 st.session_state[k] = float(v)
-
-            # 2) Fallback spiegeln
             for b365, ps in [("B365H","PSH"), ("B365D","PSD"), ("B365A","PSA")]:
                 if b365 in missing and ps in odds:
                     st.session_state[b365] = float(odds[ps])
@@ -254,7 +245,6 @@ if mode.startswith("Zukünftiges"):
                 if ps in missing and b365 in odds:
                     st.session_state[ps] = float(odds[b365])
 
-            # 3) Hinweise + Ursprungs-Quelle merken
             missing_b365 = any(x.startswith("B365") for x in missing)
             missing_ps   = any(x in ("PSH","PSD","PSA") for x in missing)
             if missing_b365 and not missing_ps:
@@ -279,13 +269,7 @@ if mode.startswith("Zukünftiges"):
             api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
             if api_key:
                 url = "https://api.the-odds-api.com/v4/sports/soccer_germany_bundesliga/odds"
-                params = {
-                    "apiKey": api_key,
-                    "regions": "eu,uk",
-                    "oddsFormat": "decimal",
-                    "markets": "h2h",
-                    "bookmakers": "pinnacle,bet365"   # <— Patch: Liste passt jetzt zum Button
-                }
+                params = {"apiKey": api_key, "regions": "eu,uk", "oddsFormat": "decimal", "markets": "h2h", "bookmakers":"pinnacle,bet365"}
                 resp = requests.get(url, params=params, timeout=12)
                 resp.raise_for_status()
                 items = resp.json()
@@ -303,7 +287,7 @@ if mode.startswith("Zukünftiges"):
 # -------------------------
 # Historischer CSV-Lookup (nur im Historik-Modus)
 # -------------------------
-if mode == "Historisches Spiel (Quoten aus CSV)":
+if mode.startswith("Historisches"):
     cands = df_all[(df_all["HomeTeam"] == home_team) & (df_all["AwayTeam"] == away_team)].copy()
     selected_row = None
     if not cands.empty:
@@ -335,25 +319,19 @@ st.caption("Niedrigere Quote = höhere implizite Wahrscheinlichkeit. Unten entfe
 
 c1, c2, c3 = st.columns(3)
 with c1:
-    B365H = st.number_input("B365H (Heimsieg)",
-        value=float(st.session_state.get("B365H", 1.80)), step=0.01, key="B365H")
+    B365H = st.number_input("B365H (Heimsieg)", value=float(st.session_state.get("B365H", 1.80)), step=0.01, key="B365H")
 with c2:
-    B365D = st.number_input("B365D (Unentschieden)",
-        value=float(st.session_state.get("B365D", 3.60)), step=0.01, key="B365D")
+    B365D = st.number_input("B365D (Unentschieden)", value=float(st.session_state.get("B365D", 3.60)), step=0.01, key="B365D")
 with c3:
-    B365A = st.number_input("B365A (Auswärtssieg)",
-        value=float(st.session_state.get("B365A", 4.20)), step=0.01, key="B365A")
+    B365A = st.number_input("B365A (Auswärtssieg)", value=float(st.session_state.get("B365A", 4.20)), step=0.01, key="B365A")
 
 c4, c5, c6 = st.columns(3)
 with c4:
-    PSH = st.number_input("PSH (Heimsieg)",
-        value=float(st.session_state.get("PSH", 1.85)), step=0.01, key="PSH")
+    PSH = st.number_input("PSH (Heimsieg)", value=float(st.session_state.get("PSH", 1.85)), step=0.01, key="PSH")
 with c5:
-    PSD = st.number_input("PSD (Unentschieden)",
-        value=float(st.session_state.get("PSD", 3.50)), step=0.01, key="PSD")
+    PSD = st.number_input("PSD (Unentschieden)", value=float(st.session_state.get("PSD", 3.50)), step=0.01, key="PSD")
 with c6:
-    PSA = st.number_input("PSA (Auswärtssieg)",
-        value=float(st.session_state.get("PSA", 4.00)), step=0.01, key="PSA")
+    PSA = st.number_input("PSA (Auswärtssieg)", value=float(st.session_state.get("PSA", 4.00)), step=0.01, key="PSA")
 
 # -------------------------------------------------
 # Debug: Eingabe prüfen
@@ -430,7 +408,6 @@ if go:
     st.altair_chart(chart, use_container_width=True)
     st.caption("Hinweis: Die Klassenreihenfolge entspricht der Reihenfolge im Training (`model.classes_`).")
 
-    # --- Faire Wahrscheinlichkeiten: exakt eine Quelle, korrekt gelabelt (inkl. gespiegelt) ---
     origin = st.session_state.get("odds_origin")  # "PS", "B365" oder None
 
     def pick_values_and_label():
@@ -444,7 +421,6 @@ if go:
             return (B365H, B365D, B365A, "Bet365")
         if has_ps:
             return (PSH, PSD, PSA, "Pinnacle (PS)")
-        # Fallback (gemischt / manuell)
         h_q = st.session_state.get("B365H", st.session_state.get("PSH", B365H))
         d_q = st.session_state.get("B365D", st.session_state.get("PSD", B365D))
         a_q = st.session_state.get("B365A", st.session_state.get("PSA", B365A))
@@ -469,30 +445,10 @@ if go:
     st.caption(f"Overround {quoten_label}: {overround:.3f}. "
                "Je größer >1, desto höher die Buchmachermarge. Wir normalisieren auf Summe=1.")
 
-with st.expander("🧠 Wie funktioniert die Vorhersage?"):
-    st.markdown("""
-**Kurz gesagt:** Das Modell nutzt Teams + Quoten und gibt **Wahrscheinlichkeiten** für H/D/A aus.  
-Die Tabelle zeigt **faire** (margenbereinigte) Buchmacher-Prozente als Vergleich.
-
-**Training**
-- Auf vielen historischen Bundesliga-Spielen (Teams als One-Hot, Quoten von Bet365 & Pinnacle, abgeleitete Features).
-
-**Modi**
-- **Zukünftiges Spiel = echte Prognose:** Aktuelle oder manuell eingegebene Quoten → Modell berechnet Wahrscheinlichkeiten.
-- **Historisches Spiel = Backtest:** Damalige Quoten werden geladen; das echte Ergebnis war bekannt. Wir prüfen nur, wie gut das Modell **getroffen hätte**.
-
-**Anzeige verstehen**
-- **Banner** = wahrscheinlichste Klasse (H/D/A).
-- **Balken** = **Modell-Wahrscheinlichkeiten** (Output des ML-Modells).
-- **Tabelle** = „faire“ Buchmacher-Wahrscheinlichkeiten aus **einem** Buchmacher (Bet365 **oder** Pinnacle), Marge entfernt (**Overround**).
-- **„(gespiegelt)“** heißt: fehlende Quoten eines Buchmachers wurden mit der anderen Quelle ergänzt (nur für konsistente Eingaben).
-
-**Grenzen**
-- Unentschieden ist generell schwerer zu treffen.
-- Keine Live-Faktoren wie Verletzungen, Form, Wetter etc. im Modell.
+    with st.expander("🧠 Wie funktioniert die Vorhersage?"):
+        st.markdown("""
+- **Training:** auf vielen historischen Spielen (Teams → One-Hot, Quoten, abgeleitete Merkmale).
+- **Vorhersage:** nutzt **nur** die aktuell eingegebenen Teams & Quoten, nicht das Datum.
+- **Historischer Modus:** holt **nur** damals gültige Quoten automatisch.
+- **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote, auf 100 % normiert (Overround entfernt).
 """)
-
-
-
-
-

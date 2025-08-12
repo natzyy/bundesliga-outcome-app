@@ -198,7 +198,7 @@ except Exception:
 st.title("⚽ Bundesliga Spielergebnis – Vorhersage")
 
 has_history = not df_all.empty
-choices = ["Zukünftiges Spiel (manuelle Quoten)"] + (["Historisches Spiel (Quoten aus CSV)"] if has_history else [])
+choices = ["Zukünftiges Spiel"] + (["Historisches Spiel"] if has_history else [])
 mode = st.radio(
     "Vorhersage-Modus",
     choices,
@@ -527,4 +527,5 @@ if go:
 - **Historischer Modus:** holt **nur** damals gültige Quoten automatisch.
 - **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote, auf 100 % normiert (Overround entfernt).
 """)
+
 

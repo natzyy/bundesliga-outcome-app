@@ -192,7 +192,6 @@ st.info(
     + (f"\n\n{train_span}" if train_span else "")
 )
 
-
 # -------------------------
 # Eingaben (Teams)
 # -------------------------
@@ -219,12 +218,15 @@ if mode.startswith("Zukünftiges"):
     if st.button("🔄 Live-Quoten laden (Bet365 & Pinnacle)"):
         try:
             odds, missing = fetch_live_odds(home_team, away_team)
-            # Reset Hinweis
+            # Reset Hinweise
             st.session_state["odds_note"] = ""
             st.session_state["odds_source_hint"] = None
+            st.session_state["odds_origin"] = None
+
             # 1) Gelieferte Werte setzen
             for k, v in odds.items():
                 st.session_state[k] = float(v)
+
             # 2) Fallback spiegeln
             for b365, ps in [("B365H","PSH"), ("B365D","PSD"), ("B365A","PSA")]:
                 if b365 in missing and ps in odds:
@@ -232,16 +234,19 @@ if mode.startswith("Zukünftiges"):
             for ps, b365 in [("PSH","B365H"), ("PSD","B365D"), ("PSA","B365A")]:
                 if ps in missing and b365 in odds:
                     st.session_state[ps] = float(odds[b365])
-            # 3) Hinweise
+
+            # 3) Hinweise + Ursprungs-Quelle merken
             missing_b365 = any(x.startswith("B365") for x in missing)
             missing_ps   = any(x in ("PSH","PSD","PSA") for x in missing)
             if missing_b365 and not missing_ps:
                 st.session_state["odds_note"] = "Bet365-Quoten fehlten – Pinnacle wurde gespiegelt."
                 st.session_state["odds_source_hint"] = "Pinnacle (PS)"
+                st.session_state["odds_origin"] = "PS"
                 st.info(st.session_state["odds_note"])
             elif missing_ps and not missing_b365:
                 st.session_state["odds_note"] = "Pinnacle-Quoten fehlten – Bet365 wurde gespiegelt."
                 st.session_state["odds_source_hint"] = "Bet365"
+                st.session_state["odds_origin"] = "B365"
                 st.info(st.session_state["odds_note"])
             elif missing_b365 and missing_ps:
                 st.warning("Von keinem Buchmacher lagen vollständige Quoten vor – bitte manuell prüfen.")
@@ -255,7 +260,13 @@ if mode.startswith("Zukünftiges"):
             api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
             if api_key:
                 url = "https://api.the-odds-api.com/v4/sports/soccer_germany_bundesliga/odds"
-                params = {"apiKey": api_key, "regions":"eu,uk", "oddsFormat":"decimal", "markets":"h2h"}
+                params = {
+                    "apiKey": api_key,
+                    "regions": "eu,uk",
+                    "oddsFormat": "decimal",
+                    "markets": "h2h",
+                    "bookmakers": "pinnacle,bet365"   # <— Patch: Liste passt jetzt zum Button
+                }
                 resp = requests.get(url, params=params, timeout=12)
                 resp.raise_for_status()
                 items = resp.json()
@@ -400,20 +411,28 @@ if go:
     st.altair_chart(chart, use_container_width=True)
     st.caption("Hinweis: Die Klassenreihenfolge entspricht der Reihenfolge im Training (`model.classes_`).")
 
-    # Quelle für faire Wahrscheinlichkeiten bestimmen
-    use_b365 = all(x in st.session_state and st.session_state[x] for x in ("B365H","B365D","B365A"))
-    use_ps   = all(x in st.session_state and st.session_state[x] for x in ("PSH","PSD","PSA"))
-    if use_b365:
-        h_q, d_q, a_q = B365H, B365D, B365A
-        quoten_label = "Bet365"
-    elif use_ps:
-        h_q, d_q, a_q = PSH, PSD, PSA
-        quoten_label = "Pinnacle (PS)"
-    else:
+    # --- Faire Wahrscheinlichkeiten: exakt eine Quelle, korrekt gelabelt (inkl. gespiegelt) ---
+    origin = st.session_state.get("odds_origin")  # "PS", "B365" oder None
+
+    def pick_values_and_label():
+        if origin == "PS":
+            return (PSH, PSD, PSA, "Pinnacle (PS) (gespiegelt)")
+        if origin == "B365":
+            return (B365H, B365D, B365A, "Bet365 (gespiegelt)")
+        has_b365 = all(x in st.session_state and st.session_state[x] for x in ("B365H","B365D","B365A"))
+        has_ps   = all(x in st.session_state and st.session_state[x] for x in ("PSH","PSD","PSA"))
+        if has_b365:
+            return (B365H, B365D, B365A, "Bet365")
+        if has_ps:
+            return (PSH, PSD, PSA, "Pinnacle (PS)")
+        # Fallback (gemischt / manuell)
         h_q = st.session_state.get("B365H", st.session_state.get("PSH", B365H))
         d_q = st.session_state.get("B365D", st.session_state.get("PSD", B365D))
         a_q = st.session_state.get("B365A", st.session_state.get("PSA", B365A))
-        quoten_label = st.session_state.get("odds_source_hint") or "gemischte Quelle"
+        label = st.session_state.get("odds_source_hint") or "Quelle (gemischt)"
+        return (h_q, d_q, a_q, label)
+
+    h_q, d_q, a_q, quoten_label = pick_values_and_label()
 
     st.subheader(f"Quoten → (faire) Wahrscheinlichkeiten – {quoten_label}")
     pH, pD, pA, overround = implied_probs_from_odds(h_q, d_q, a_q)
@@ -428,7 +447,7 @@ if go:
         "Implied p (unnormiert)": "{:.3f}",
         "Faire p (normiert)": "{:.3f}"
     }))
-    st.caption(f"Overround (Summe der inversen Quoten) = {overround:.3f}. "
+    st.caption(f"Overround {quoten_label}: {overround:.3f}. "
                "Je größer >1, desto höher die Buchmachermarge. Wir normalisieren auf Summe=1.")
 
     with st.expander("🧠 Wie funktioniert die Vorhersage?"):
@@ -438,5 +457,3 @@ if go:
 - **Historischer Modus:** holt **nur** damals gültige Quoten automatisch.
 - **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote, auf 100 % normiert (Overround entfernt).
 """)
-
-

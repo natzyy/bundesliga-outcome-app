@@ -104,83 +104,151 @@ def _any_match(user_set: set, ev_name: str) -> bool:
 # Provider A: The Odds API
 # ===========================
 @st.cache_data(ttl=120)
-def _fetch_odds_oddsapi(home_team, away_team, sport_key="soccer_germany_bundesliga",
-                        want_books=("pinnacle","bet365")):
-    api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY","")).strip()
+def fetch_live_odds(
+    home_team,
+    away_team,
+    sport_key: str = "soccer_germany_bundesliga",
+    want_books: tuple[str, ...] = ("pinnacle", "bet365"),
+):
+    """
+    Holt Live-Quoten. Erst versucht es beide Bookies zusammen.
+    Fehlen Werte, werden gezielt die einzelnen Bookies nachgeladen.
+    Inklusive flip-Korrektur + Plausibilitätscheck.
+    """
+    import datetime as dt
+
+    api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
     if not api_key:
         raise RuntimeError("ODDS_API_KEY fehlt. In Streamlit → Settings → Secrets eintragen.")
 
+    # ---------- Helpers ----------
     nh, na = _alias_set(home_team), _alias_set(away_team)
 
-    def call(bookmakers_csv: str | None):
+    def _any_match(user_set: set, ev_name: str) -> bool:
+        evn = _norm(ev_name or "")
+        if evn in user_set:
+            return True
+        for u in user_set:
+            if u in evn or evn in u:
+                return True
+        return False
+
+    def call_api(bookmakers_csv: str | None):
+        """API-Call mit Zeitfenster und optionalem Bookmaker-Filter."""
+        now = dt.datetime.utcnow()
         params = {
             "apiKey": api_key,
-            "regions": "eu,uk,us",
+            "regions": "eu,uk",          # enger fassen; vermeidet US/au Abweichungen
             "oddsFormat": "decimal",
             "markets": "h2h",
+            "commenceTimeFrom": (now - dt.timedelta(hours=12)).isoformat() + "Z",
+            "commenceTimeTo":   (now + dt.timedelta(days=14)).isoformat() + "Z",
         }
         if bookmakers_csv:
             params["bookmakers"] = bookmakers_csv
-        url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-        r = requests.get(url, params=params, timeout=12)
+
+        r = requests.get(f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
+                         params=params, timeout=12)
         r.raise_for_status()
         return r.json()
 
     def find_match(items):
+        """Suche Event + bestimme flip (falls API-Home != User-Home)."""
         for ev in items:
-            h = ev.get("home_team","")
-            a = ev.get("away_team","")
-            if (_any_match(nh,h) and _any_match(na,a)) or (_any_match(nh,a) and _any_match(na,h)):
-                flip = (_any_match(nh,a) and _any_match(na,h))
+            ev_home = ev.get("home_team", "")
+            ev_away = ev.get("away_team", "")
+            if (_any_match(nh, ev_home) and _any_match(na, ev_away)) or \
+               (_any_match(nh, ev_away) and _any_match(na, ev_home)):
+                flip = (_any_match(nh, ev_away) and _any_match(na, ev_home))
                 return ev, flip
         return None, False
 
-    def merge_event(ev, res: dict):
+    def sanity_ok(h, d, a) -> bool:
+        """Plausibilitätscheck: Summe(1/odds) in [0.95, 1.25] und Quoten in [1.01, 15]."""
+        try:
+            if not (1.01 <= h <= 15 and 1.01 <= d <= 15 and 1.01 <= a <= 15):
+                return False
+            s = (1.0/h) + (1.0/d) + (1.0/a)
+            return 0.95 <= s <= 1.25
+        except Exception:
+            return False
+
+    def merge_from_event(ev, flip: bool, res: dict):
+        """Ziehe aus einem Event die h2h-Quoten und schreibe in res (B365*, PS*)."""
+        tmp_ps = {}
+        tmp_b3 = {}
         for bk in ev.get("bookmakers", []):
-            bname = (bk.get("key","") or "").lower()
+            bname = (bk.get("key", "") or "").lower()
             if bname not in want_books:
                 continue
             for m in bk.get("markets", []):
                 if m.get("key") != "h2h":
                     continue
+                H = D = A = None
                 for out in m.get("outcomes", []):
-                    nm = _norm(out.get("name",""))
+                    nm = _norm(out.get("name", ""))
                     price = float(out.get("price"))
                     code = None
-                    if nm in ("draw","unentschieden"): code = "D"
-                    elif nm in nh: code = "H"
-                    elif nm in na: code = "A"
-                    elif nm in ("home","heim"): code = "H"
-                    elif nm in ("away","auswaerts","auswärts","auswarts","gast","away team"): code = "A"
-                    if not code: continue
-                    if bname == "pinnacle": res[f"PS{code}"] = price
-                    elif bname == "bet365": res[f"B365{code}"] = price
+                    if nm in ("draw", "unentschieden"):
+                        code = "D"
+                    elif nm in nh:
+                        code = "H"
+                    elif nm in na:
+                        code = "A"
+                    elif nm in ("home", "heim"):
+                        code = "A" if flip else "H"
+                    elif nm in ("away", "auswaerts", "auswärts", "auswarts", "gast", "away team"):
+                        code = "H" if flip else "A"
+                    if code == "H": H = price
+                    elif code == "D": D = price
+                    elif code == "A": A = price
+                if H and D and A and sanity_ok(H, D, A):
+                    if bname == "pinnacle":
+                        tmp_ps = {"PSH": H, "PSD": D, "PSA": A}
+                    elif bname == "bet365":
+                        tmp_b3 = {"B365H": H, "B365D": D, "B365A": A}
 
-    # Kombiniert
-    data = call(",".join(want_books))
-    ev, _ = find_match(data)
-    # Ohne Filter, falls nicht gefunden
-    if not ev:
-        data_all = call(None)
-        ev, _ = find_match(data_all)
-        if not ev:
-            raise LookupError("Kein passendes Event in The Odds API gefunden.")
+        res.update(tmp_ps)
+        res.update(tmp_b3)
 
-    res = {}
-    merge_event(ev, res)
+    # ---------- 1) Kombinierter Call ----------
+    data = call_api(",".join(want_books))
+    matched, flip = find_match(data)
 
-    # gezielt je Bookie nachladen
-    need_b365 = any(k not in res for k in ("B365H","B365D","B365A"))
-    need_ps   = any(k not in res for k in ("PSH","PSD","PSA"))
-    if need_b365:
-        ev_b, _ = find_match(call("bet365"))
-        if ev_b: merge_event(ev_b, res)
-    if need_ps:
-        ev_p, _ = find_match(call("pinnacle"))
-        if ev_p: merge_event(ev_p, res)
+    # Fallback: ohne Bookmaker-Filter
+    if not matched:
+        data_all = call_api(None)
+        matched, flip = find_match(data_all)
+        if not matched:
+            raise LookupError("Kein passendes Event gefunden (noch nicht gelistet oder Namensvariante).")
 
+    res: dict[str, float] = {}
+    merge_from_event(matched, flip, res)
+
+    # ---------- 2) Nachladen je Bookie, falls fehlend ----------
+    if any(k not in res for k in ("B365H", "B365D", "B365A")):
+        d2 = call_api("bet365"); m2, f2 = find_match(d2)
+        if m2: merge_from_event(m2, f2, res)
+    if any(k not in res for k in ("PSH", "PSD", "PSA")):
+        d3 = call_api("pinnacle"); m3, f3 = find_match(d3)
+        if m3: merge_from_event(m3, f3, res)
+
+    # ---------- 3) Spiegeln, wenn nur ein Bookie vorhanden ----------
     need = ["B365H","B365D","B365A","PSH","PSD","PSA"]
     missing = [k for k in need if k not in res]
+
+    if any(k.startswith("B365") for k in missing) and all(k in res for k in ("PSH","PSD","PSA")):
+        res.setdefault("B365H", res["PSH"])
+        res.setdefault("B365D", res["PSD"])
+        res.setdefault("B365A", res["PSA"])
+        missing = [k for k in need if k not in res]
+
+    if any(k in ("PSH","PSD","PSA") for k in missing) and all(k in res for k in ("B365H","B365D","B365A")):
+        res.setdefault("PSH", res["B365H"])
+        res.setdefault("PSD", res["B365D"])
+        res.setdefault("PSA", res["B365A"])
+        missing = [k for k in need if k not in res]
+
     return res, missing
 
 # ===========================
@@ -515,3 +583,4 @@ if go:
     }))
     st.caption(f"Overround {label}: {overround:.3f}. "
                "Je größer >1, desto höher die Buchmachermarge. Wir normalisieren auf Summe=1.")
+

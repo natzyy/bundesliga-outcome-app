@@ -96,16 +96,28 @@ def _alias_set(name: str) -> set:
     return set([k] + ALIASES.get(k, []))
 
 @st.cache_data(ttl=120)
-def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga",
-                    want_books=("pinnacle","bet365")):
+def fetch_live_odds(
+    home_team,
+    away_team,
+    sport_key: str = "soccer_germany_bundesliga",
+    want_books: tuple[str, ...] = ("pinnacle", "bet365"),
+):
+    """
+    Holt Live-Quoten. Erst versucht es beide Bookies zusammen.
+    Falls z.B. Bet365 im kombinierten Call fehlt, wird gezielt
+    noch einmal NUR Bet365 abgefragt und gemerged. Gleiches für Pinnacle.
+    """
+    import datetime as dt
+
     api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
     if not api_key:
-        raise RuntimeError("ODDS_API_KEY fehlt. In Streamlit > Settings > Secrets eintragen.")
+        raise RuntimeError("ODDS_API_KEY fehlt. In Streamlit → Settings → Secrets eintragen.")
 
+    # -------- Helpers --------
     nh, na = _alias_set(home_team), _alias_set(away_team)
 
     def _any_match(user_set: set, ev_name: str) -> bool:
-        evn = _norm(ev_name)
+        evn = _norm(ev_name or "")
         if evn in user_set:
             return True
         for u in user_set:
@@ -113,63 +125,116 @@ def fetch_live_odds(home_team, away_team, sport_key="soccer_germany_bundesliga",
                 return True
         return False
 
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-    params = {
-        "apiKey": api_key,
-        "regions": "eu,uk,us",
-        "oddsFormat": "decimal",
-        "markets": "h2h",
-        "bookmakers": ",".join(want_books),
-    }
-    r = requests.get(url, params=params, timeout=12)
-    r.raise_for_status()
-    data = r.json()
+    def call_api(bookmakers_csv: str | None):
+        """API-Call mit Zeitfenster und optionalem Bookmaker-Filter."""
+        now = dt.datetime.utcnow()
+        params = {
+            "apiKey": api_key,
+            "regions": "eu,uk,us,au",         # bewusst breit
+            "oddsFormat": "decimal",
+            "markets": "h2h",
+            "commenceTimeFrom": (now - dt.timedelta(hours=12)).isoformat() + "Z",
+            "commenceTimeTo":   (now + dt.timedelta(days=14)).isoformat() + "Z",
+        }
+        if bookmakers_csv:
+            params["bookmakers"] = bookmakers_csv
 
-    match = None
-    flip = False
-    for ev in data:
-        ev_home_raw = ev.get("home_team", "")
-        ev_away_raw = ev.get("away_team", "")
-        if (_any_match(nh, ev_home_raw) and _any_match(na, ev_away_raw)) or \
-           (_any_match(nh, ev_away_raw) and _any_match(na, ev_home_raw)):
-            match = ev
-            flip = (_any_match(nh, ev_away_raw) and _any_match(na, ev_home_raw))
-            break
+        r = requests.get(f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
+                         params=params, timeout=12)
+        r.raise_for_status()
+        return r.json()
 
-    if not match:
-        raise LookupError("Kein passendes Event für diese Teams gefunden (noch nicht gelistet oder Namensvariante).")
+    def find_match(items):
+        """Suche Event + bestimme flip (falls API-Home != User-Home)."""
+        for ev in items:
+            ev_home = ev.get("home_team", "")
+            ev_away = ev.get("away_team", "")
+            if (_any_match(nh, ev_home) and _any_match(na, ev_away)) or \
+               (_any_match(nh, ev_away) and _any_match(na, ev_home)):
+                flip = (_any_match(nh, ev_away) and _any_match(na, ev_home))
+                return ev, flip
+        return None, False
 
-    res = {}
-    for bk in match.get("bookmakers", []):
-        bname = (bk.get("key","") or "").lower()
-        if bname not in want_books:
-            continue
-        for m in bk.get("markets", []):
-            if m.get("key") != "h2h":
+    def merge_from_event(ev, res: dict):
+        """Ziehe aus einem Event die h2h-Quoten der gewünschten Bookies und
+        schreibe in res (B365H/D/A, PSH/D/A)."""
+        for bk in ev.get("bookmakers", []):
+            bname = (bk.get("key", "") or "").lower()
+            if bname not in want_books:
                 continue
-            for out in m.get("outcomes", []):
-                nm = _norm(out.get("name",""))
-                price = float(out.get("price"))
-                code = None
-                if nm in ("draw","unentschieden"):
-                    code = "D"
-                elif nm in nh:
-                    code = "H"
-                elif nm in na:
-                    code = "A"
-                elif nm in ("home","heim"):
-                    code = "A" if flip else "H"
-                elif nm in ("away","auswaerts","auswarts","gast","away team"):
-                    code = "H" if flip else "A"
-                if not code:
+            for m in bk.get("markets", []):
+                if m.get("key") != "h2h":
                     continue
-                if "pinnacle" in bname:
-                    res[f"PS{code}"] = price
-                elif "bet365" in bname:
-                    res[f"B365{code}"] = price
+                for out in m.get("outcomes", []):
+                    nm = _norm(out.get("name", ""))
+                    price = float(out.get("price"))
+                    code = None
+                    if nm in ("draw", "unentschieden"):
+                        code = "D"
+                    elif nm in nh:
+                        code = "H"
+                    elif nm in na:
+                        code = "A"
+                    elif nm in ("home", "heim"):
+                        code = "H"
+                    elif nm in ("away", "auswaerts", "auswärts", "auswarts", "gast", "away team"):
+                        code = "A"
+                    if not code:
+                        continue
 
-    need = ["B365H","B365D","B365A","PSH","PSD","PSA"]
+                    if bname == "pinnacle":
+                        res[f"PS{code}"] = price
+                    elif bname == "bet365":
+                        res[f"B365{code}"] = price
+
+    # -------- 1) Kombinierter Call (beide Bookies) --------
+    data = call_api(",".join(want_books))
+    matched, flip = find_match(data)
+
+    # Falls gar kein Match: ohne Bookmaker-Filter probieren (manche Feeds listen anders)
+    if not matched:
+        data_all = call_api(None)
+        matched, flip = find_match(data_all)
+        if not matched:
+            raise LookupError("Kein passendes Event für diese Teams gefunden (noch nicht gelistet oder Namensvariante).")
+
+    # Quoten aus kombinierten Daten ziehen
+    res: dict[str, float] = {}
+    merge_from_event(matched, res)
+
+    # -------- 2) Nachladen je Bookie, falls im kombinierten Call fehlend --------
+    need_b365 = any(k not in res for k in ("B365H", "B365D", "B365A"))
+    need_ps   = any(k not in res for k in ("PSH", "PSD", "PSA"))
+
+    if need_b365:
+        data_b365 = call_api("bet365")
+        m2, _ = find_match(data_b365)
+        if m2:
+            merge_from_event(m2, res)
+
+    if need_ps:
+        data_ps = call_api("pinnacle")
+        m3, _ = find_match(data_ps)
+        if m3:
+            merge_from_event(m3, res)
+
+    # Fehlende Felder (für Hinweis in der UI)
+    need = ["B365H", "B365D", "B365A", "PSH", "PSD", "PSA"]
     missing = [k for k in need if k not in res]
+
+    # Falls ein kompletter Bookie fehlt, aber der andere vorhanden ist: spiegeln
+    if any(k.startswith("B365") for k in missing) and all(k in res for k in ("PSH","PSD","PSA")):
+        res.setdefault("B365H", res["PSH"])
+        res.setdefault("B365D", res["PSD"])
+        res.setdefault("B365A", res["PSA"])
+        missing = [k for k in need if k not in res]
+
+    if any(k in ("PSH","PSD","PSA") for k in missing) and all(k in res for k in ("B365H","B365D","B365A")):
+        res.setdefault("PSH", res["B365H"])
+        res.setdefault("PSD", res["B365D"])
+        res.setdefault("PSA", res["B365A"])
+        missing = [k for k in need if k not in res]
+
     return res, missing
 
 # -------------------------------------------------
@@ -456,3 +521,4 @@ if go:
 - **Historischer Modus:** lädt **nur** die damaligen Quoten (Backtest).
 - **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote (Overround entfernt).
 """)
+

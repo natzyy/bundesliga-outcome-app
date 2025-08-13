@@ -3,14 +3,14 @@ import pandas as pd
 import joblib
 import numpy as np
 import altair as alt
-import os, requests, re, unicodedata
+import os, requests, re, unicodedata, datetime as dt
 from pathlib import Path
 
 # -------------------------------------------------
 # Seite konfigurieren
 # -------------------------------------------------
 st.set_page_config(page_title="Bundesliga Spielergebnis", page_icon="⚽", layout="centered")
-st.sidebar.success("Build: UI-Mode + CSV/LiveOdds (simple)")
+st.sidebar.success("Build: UI-Mode + CSV/LiveOdds (combined)")
 
 # -------------------------------------------------
 # Daten laden (historische CSVs für Quoten-Autofill)
@@ -56,7 +56,7 @@ except Exception as e:
     df_all = pd.DataFrame(columns=["HomeTeam","AwayTeam","B365H","B365D","B365A","PSH","PSD","PSA","Date"])
 
 # -------------------------------------------------
-# Live-Quoten (The Odds API, v4)
+# Normalisierung / Aliase
 # -------------------------------------------------
 def _norm(s: str) -> str:
     s = s or ""
@@ -76,7 +76,7 @@ ALIASES = {
     "borussia monchengladbach": ["borussia monchengladbach", "monchengladbach", "gladbach"],
     "koln": ["koln", "fc koln", "1 fc koln", "koln 1 fc", "kolner"],
     "union berlin": ["union berlin", "1 fc union berlin", "union"],
-    "eintracht frankfurt": ["eintracht frankfurt", "frankfurt"],
+    "eintracht frankfurt": ["eintracht frankfurt", "frankfurt", "ein frankfurt"],
     "werder bremen": ["werder bremen", "bremen"],
     "vfb stuttgart": ["stuttgart", "vfb stuttgart"],
     "vfl wolfsburg": ["wolfsburg"],
@@ -89,153 +89,188 @@ ALIASES = {
     "st pauli": ["st pauli", "fc st pauli"],
     "fortuna dusseldorf": ["fortuna dusseldorf", "fortuna"],
     "hamburger sv": ["hamburger sv", "hamburg"],
-    "ein frankfurt": ["ein frankfurt", "eintracht frankfurt", "frankfurt"],
 }
 def _alias_set(name: str) -> set:
     k = _norm(name)
     return set([k] + ALIASES.get(k, []))
 
-@st.cache_data(ttl=120)
-def fetch_live_odds(
-    home_team,
-    away_team,
-    sport_key: str = "soccer_germany_bundesliga",
-    want_books: tuple[str, ...] = ("pinnacle", "bet365"),
-):
-    """
-    Holt Live-Quoten. Erst versucht es beide Bookies zusammen.
-    Falls z.B. Bet365 im kombinierten Call fehlt, wird gezielt
-    noch einmal NUR Bet365 abgefragt und gemerged. Gleiches für Pinnacle.
-    """
-    import datetime as dt
+def _any_match(user_set: set, ev_name: str) -> bool:
+    evn = _norm(ev_name or "")
+    if evn in user_set:
+        return True
+    return any((u in evn) or (evn in u) for u in user_set)
 
-    api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
+# -------------------------------------------------
+# Provider A: The Odds API (v4) – H2H/3-Way
+# -------------------------------------------------
+@st.cache_data(ttl=120)
+def _fetch_odds_oddsapi(home_team, away_team, sport_key="soccer_germany_bundesliga",
+                        want_books=("pinnacle","bet365")):
+    api_key = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY","")).strip()
     if not api_key:
         raise RuntimeError("ODDS_API_KEY fehlt. In Streamlit → Settings → Secrets eintragen.")
 
-    # -------- Helpers --------
     nh, na = _alias_set(home_team), _alias_set(away_team)
 
-    def _any_match(user_set: set, ev_name: str) -> bool:
-        evn = _norm(ev_name or "")
-        if evn in user_set:
-            return True
-        for u in user_set:
-            if u in evn or evn in u:
-                return True
-        return False
-
-    def call_api(bookmakers_csv: str | None):
-        """API-Call mit Zeitfenster und optionalem Bookmaker-Filter."""
-        now = dt.datetime.utcnow()
+    def call(bookmakers_csv: str | None):
         params = {
             "apiKey": api_key,
-            "regions": "eu,uk,us,au",         # bewusst breit
+            "regions": "eu,uk,us",   # bewusst breit
             "oddsFormat": "decimal",
             "markets": "h2h",
-            "commenceTimeFrom": (now - dt.timedelta(hours=12)).isoformat() + "Z",
-            "commenceTimeTo":   (now + dt.timedelta(days=14)).isoformat() + "Z",
         }
         if bookmakers_csv:
             params["bookmakers"] = bookmakers_csv
-
-        r = requests.get(f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
-                         params=params, timeout=12)
+        url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+        r = requests.get(url, params=params, timeout=12)
         r.raise_for_status()
         return r.json()
 
     def find_match(items):
-        """Suche Event + bestimme flip (falls API-Home != User-Home)."""
         for ev in items:
-            ev_home = ev.get("home_team", "")
-            ev_away = ev.get("away_team", "")
-            if (_any_match(nh, ev_home) and _any_match(na, ev_away)) or \
-               (_any_match(nh, ev_away) and _any_match(na, ev_home)):
-                flip = (_any_match(nh, ev_away) and _any_match(na, ev_home))
+            h = ev.get("home_team","")
+            a = ev.get("away_team","")
+            if (_any_match(nh,h) and _any_match(na,a)) or (_any_match(nh,a) and _any_match(na,h)):
+                flip = (_any_match(nh,a) and _any_match(na,h))
                 return ev, flip
         return None, False
 
-    def merge_from_event(ev, res: dict):
-        """Ziehe aus einem Event die h2h-Quoten der gewünschten Bookies und
-        schreibe in res (B365H/D/A, PSH/D/A)."""
+    def merge_event(ev, res: dict):
         for bk in ev.get("bookmakers", []):
-            bname = (bk.get("key", "") or "").lower()
+            bname = (bk.get("key","") or "").lower()
             if bname not in want_books:
                 continue
             for m in bk.get("markets", []):
                 if m.get("key") != "h2h":
                     continue
                 for out in m.get("outcomes", []):
-                    nm = _norm(out.get("name", ""))
+                    nm = _norm(out.get("name",""))
                     price = float(out.get("price"))
                     code = None
-                    if nm in ("draw", "unentschieden"):
+                    if nm in ("draw","unentschieden"):
                         code = "D"
                     elif nm in nh:
                         code = "H"
                     elif nm in na:
                         code = "A"
-                    elif nm in ("home", "heim"):
+                    elif nm in ("home","heim"):
                         code = "H"
-                    elif nm in ("away", "auswaerts", "auswärts", "auswarts", "gast", "away team"):
+                    elif nm in ("away","auswaerts","auswärts","auswarts","gast","away team"):
                         code = "A"
                     if not code:
                         continue
-
                     if bname == "pinnacle":
                         res[f"PS{code}"] = price
                     elif bname == "bet365":
                         res[f"B365{code}"] = price
 
-    # -------- 1) Kombinierter Call (beide Bookies) --------
-    data = call_api(",".join(want_books))
-    matched, flip = find_match(data)
+    # 1) Kombiniert
+    data = call(",".join(want_books))
+    ev, _ = find_match(data)
+    # 2) ohne Filter, falls nicht gefunden
+    if not ev:
+        data_all = call(None)
+        ev, _ = find_match(data_all)
+        if not ev:
+            raise LookupError("Kein passendes Event in The Odds API gefunden.")
 
-    # Falls gar kein Match: ohne Bookmaker-Filter probieren (manche Feeds listen anders)
-    if not matched:
-        data_all = call_api(None)
-        matched, flip = find_match(data_all)
-        if not matched:
-            raise LookupError("Kein passendes Event für diese Teams gefunden (noch nicht gelistet oder Namensvariante).")
+    res = {}
+    merge_event(ev, res)
 
-    # Quoten aus kombinierten Daten ziehen
-    res: dict[str, float] = {}
-    merge_from_event(matched, res)
-
-    # -------- 2) Nachladen je Bookie, falls im kombinierten Call fehlend --------
-    need_b365 = any(k not in res for k in ("B365H", "B365D", "B365A"))
-    need_ps   = any(k not in res for k in ("PSH", "PSD", "PSA"))
-
+    # 3) je Bookie gezielt nachladen, falls im Kombi-Call fehlend
+    need_b365 = any(k not in res for k in ("B365H","B365D","B365A"))
+    need_ps   = any(k not in res for k in ("PSH","PSD","PSA"))
     if need_b365:
-        data_b365 = call_api("bet365")
-        m2, _ = find_match(data_b365)
-        if m2:
-            merge_from_event(m2, res)
-
+        ev_b, _ = find_match(call("bet365"))
+        if ev_b: merge_event(ev_b, res)
     if need_ps:
-        data_ps = call_api("pinnacle")
-        m3, _ = find_match(data_ps)
-        if m3:
-            merge_from_event(m3, res)
+        ev_p, _ = find_match(call("pinnacle"))
+        if ev_p: merge_event(ev_p, res)
 
-    # Fehlende Felder (für Hinweis in der UI)
-    need = ["B365H", "B365D", "B365A", "PSH", "PSD", "PSA"]
+    need = ["B365H","B365D","B365A","PSH","PSD","PSA"]
     missing = [k for k in need if k not in res]
-
-    # Falls ein kompletter Bookie fehlt, aber der andere vorhanden ist: spiegeln
-    if any(k.startswith("B365") for k in missing) and all(k in res for k in ("PSH","PSD","PSA")):
-        res.setdefault("B365H", res["PSH"])
-        res.setdefault("B365D", res["PSD"])
-        res.setdefault("B365A", res["PSA"])
-        missing = [k for k in need if k not in res]
-
-    if any(k in ("PSH","PSD","PSA") for k in missing) and all(k in res for k in ("B365H","B365D","B365A")):
-        res.setdefault("PSH", res["B365H"])
-        res.setdefault("PSD", res["B365D"])
-        res.setdefault("PSA", res["B365A"])
-        missing = [k for k in need if k not in res]
-
     return res, missing
+
+# -------------------------------------------------
+# Provider B: SportMonks – nur Bet365 ergänzen (Bookmaker 2, Market 1=1X2)
+# -------------------------------------------------
+@st.cache_data(ttl=120)
+def _fetch_bet365_from_sportmonks(home_team, away_team, days_ahead=21):
+    token = st.secrets.get("SPORTMONKS_TOKEN", os.getenv("SPORTMONKS_TOKEN","")).strip()
+    if not token:
+        return {}  # kein Token => kein Fallback
+
+    nh, na = _alias_set(home_team), _alias_set(away_team)
+
+    since = (dt.datetime.utcnow() - dt.timedelta(hours=12)).strftime("%Y-%m-%d")
+    until = (dt.datetime.utcnow() + dt.timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
+    # Fixtures im Fenster inkl. Teilnehmer
+    fx_url = f"https://api.sportmonks.com/v3/football/fixtures/date/{since}/{until}"
+    fx_params = {"api_token": token, "include": "participants"}
+    fx = requests.get(fx_url, params=fx_params, timeout=12)
+    fx.raise_for_status()
+    fx_data = fx.json().get("data", []) or []
+
+    fixture_id = None
+    for ev in fx_data:
+        names = [p.get("name","") for p in (ev.get("participants") or [])]
+        if len(names) >= 2:
+            if (_any_match(nh, names[0]) and _any_match(na, names[1])) or (_any_match(nh, names[1]) and _any_match(na, names[0])):
+                fixture_id = ev.get("id")
+                break
+    if not fixture_id:
+        return {}
+
+    # Odds für Bet365 (Bookmaker 2) im Market 1 (1X2)
+    odd_url = f"https://api.sportmonks.com/v3/odds/pre-match/fixtures/{fixture_id}/bookmakers/2"
+    odd_params = {"api_token": token, "markets": "1"}
+    od = requests.get(odd_url, params=odd_params, timeout=12)
+    od.raise_for_status()
+    odds_data = od.json().get("data", []) or []
+
+    out = {}
+    for market in odds_data:
+        if str(market.get("market_id")) != "1":
+            continue
+        for o in market.get("odds", []) or []:
+            nm = _norm(o.get("label","") or o.get("name",""))
+            price = o.get("value") or o.get("decimal") or o.get("price")
+            if price is None:
+                continue
+            price = float(price)
+            if nm in ("home","heim","heimsieg"):
+                out["B365H"] = price
+            elif nm in ("draw","unentschieden"):
+                out["B365D"] = price
+            elif nm in ("away","auswaerts","auswärts","gast"):
+                out["B365A"] = price
+    return out
+
+# -------------------------------------------------
+# Kombi-Fetch: zuerst OddsAPI, fehlendes Bet365 via SportMonks ergänzen
+# -------------------------------------------------
+def fetch_live_odds_combined(home_team, away_team):
+    note = None
+    try:
+        odds, missing = _fetch_odds_oddsapi(home_team, away_team)
+    except Exception as e:
+        odds, missing = {}, []
+        note = f"Odds API nicht verfügbar: {e}"
+
+    # nur Bet365 (falls fehlt) mit SportMonks ergänzen
+    need_b365 = any(k not in odds for k in ("B365H","B365D","B365A"))
+    if need_b365:
+        try:
+            b365 = _fetch_bet365_from_sportmonks(home_team, away_team)
+            for k, v in b365.items():
+                odds.setdefault(k, v)
+        except Exception as e:
+            note = (note + " | " if note else "") + f"SportMonks nicht verfügbar: {e}"
+
+    need = ["B365H","B365D","B365A","PSH","PSD","PSA"]
+    missing = [k for k in need if k not in odds]
+    return odds, missing, note
 
 # -------------------------------------------------
 # Modell laden + Teamliste
@@ -301,40 +336,27 @@ with colB:
 if mode.startswith("Zukünftiges"):
     if st.button("🔄 Live-Quoten laden (Bet365 & Pinnacle)"):
         try:
-            odds, missing = fetch_live_odds(home_team, away_team)
+            odds, missing, provider_note = fetch_live_odds_combined(home_team, away_team)
 
             # Reset Hinweise
             st.session_state["odds_note"] = ""
-            st.session_state["odds_source_hint"] = None
             st.session_state["odds_origin"] = None
 
-            # Gelieferte Werte setzen
+            # Nur echte, gelieferte Werte setzen (kein Spiegeln)
             for k, v in odds.items():
                 st.session_state[k] = float(v)
 
-            # Fallback spiegeln
-            for b365, ps in [("B365H","PSH"), ("B365D","PSD"), ("B365A","PSA")]:
-                if b365 in missing and ps in odds:
-                    st.session_state[b365] = float(odds[ps])
-            for ps, b365 in [("PSH","B365H"), ("PSD","B365D"), ("PSA","B365A")]:
-                if ps in missing and b365 in odds:
-                    st.session_state[ps] = float(odds[b365])
+            # Wenn Bet365 trotz beider Feeds fehlt → deutlicher Hinweis
+            still_missing_b365 = any(k not in odds for k in ("B365H","B365D","B365A"))
+            if still_missing_b365:
+                st.warning("**Daten von Bet365 fehlen (Feed/Lizenz). "
+                           "Bitte Bet365-Quoten manuell eintragen.**")
 
-            # Hinweise + Ursprungs-Quelle
-            missing_b365 = any(x.startswith("B365") for x in missing)
-            missing_ps   = any(x in ("PSH","PSD","PSA") for x in missing)
-            if missing_b365 and not missing_ps:
-                st.session_state["odds_note"] = "Bet365-Quoten fehlten – Pinnacle wurde gespiegelt."
-                st.session_state["odds_source_hint"] = "Pinnacle (PS)"
-                st.session_state["odds_origin"] = "PS"
-                st.info(st.session_state["odds_note"])
-            elif missing_ps and not missing_b365:
-                st.session_state["odds_note"] = "Pinnacle-Quoten fehlten – Bet365 wurde gespiegelt."
-                st.session_state["odds_source_hint"] = "Bet365"
-                st.session_state["odds_origin"] = "B365"
-                st.info(st.session_state["odds_note"])
-            elif missing_b365 and missing_ps:
-                st.warning("Von keinem Buchmacher lagen vollständige Quoten vor – bitte manuell prüfen.")
+            if provider_note:
+                st.info(provider_note)
+
+            if not odds:
+                st.error("Keine Live-Quoten gefunden – bitte manuell eintragen.")
             else:
                 st.success("Live-Quoten geladen.")
         except Exception as e:
@@ -363,7 +385,7 @@ if mode.startswith("Historisches"):
         st.info("Kein historisches Spiel mit Quoten für diese Heim-/Auswärts-Kombination gefunden.")
 
 # -------------------------------------------------
-# Eingaben: Quoten (manuell oder via CSV-Autofill)
+# Eingaben: Quoten (manuell oder via CSV/Live)
 # -------------------------------------------------
 st.markdown(
     "### Wettquoten " +
@@ -470,55 +492,33 @@ if go:
     st.altair_chart(chart, use_container_width=True)
     st.caption("Hinweis: Die Klassenreihenfolge entspricht der Reihenfolge im Training (`model.classes_`).")
 
-    # Faire Wahrscheinlichkeiten – Quelle korrekt labeln (inkl. gespiegelt)
-    origin = st.session_state.get("odds_origin")  # "PS", "B365" oder None
-    def pick_values_and_label():
-        if origin == "PS":
-            return (st.session_state.get("PSH", np.nan),
-                    st.session_state.get("PSD", np.nan),
-                    st.session_state.get("PSA", np.nan),
-                    "Pinnacle (PS) (gespiegelt)")
-        if origin == "B365":
-            return (st.session_state.get("B365H", np.nan),
-                    st.session_state.get("B365D", np.nan),
-                    st.session_state.get("B365A", np.nan),
-                    "Bet365 (gespiegelt)")
-        has_b365 = all(x in st.session_state and st.session_state[x] for x in ("B365H","B365D","B365A"))
-        has_ps   = all(x in st.session_state and st.session_state[x] for x in ("PSH","PSD","PSA"))
-        if has_b365:
-            return (st.session_state["B365H"], st.session_state["B365D"], st.session_state["B365A"], "Bet365")
-        if has_ps:
-            return (st.session_state["PSH"], st.session_state["PSD"], st.session_state["PSA"], "Pinnacle (PS)")
-        # Fallback (gemischt / manuell)
+    # Faire Wahrscheinlichkeiten – Quelle korrekt labeln
+    has_b365 = all(k in st.session_state for k in ("B365H","B365D","B365A"))
+    has_ps   = all(k in st.session_state for k in ("PSH","PSD","PSA"))
+    if has_b365:
+        h_q, d_q, a_q = st.session_state["B365H"], st.session_state["B365D"], st.session_state["B365A"]
+        label = "Bet365"
+    elif has_ps:
+        h_q, d_q, a_q = st.session_state["PSH"], st.session_state["PSD"], st.session_state["PSA"]
+        label = "Pinnacle (PS)"
+    else:
         h_q = st.session_state.get("B365H", st.session_state.get("PSH", B365H))
         d_q = st.session_state.get("B365D", st.session_state.get("PSD", B365D))
         a_q = st.session_state.get("B365A", st.session_state.get("PSA", B365A))
-        label = st.session_state.get("odds_source_hint") or "Quelle (gemischt / manuell)"
-        return (h_q, d_q, a_q, label)
+        label = "Quelle (gemischt / manuell)"
 
-    h_q, d_q, a_q, quoten_label = pick_values_and_label()
-
-    st.subheader(f"Quoten → (faire) Wahrscheinlichkeiten – {quoten_label}")
+    st.subheader(f"Quoten → (faire) Wahrscheinlichkeiten – {label}")
     pH, pD, pA, overround = implied_probs_from_odds(h_q, d_q, a_q)
     tbl = pd.DataFrame({
         "Ereignis": ["Heimsieg (H)", "Unentschieden (D)", "Auswärtssieg (A)"],
-        f"Quote ({quoten_label})": [h_q, d_q, a_q],
+        f"Quote ({label})": [h_q, d_q, a_q],
         "Implied p (unnormiert)": [1/h_q, 1/d_q, 1/a_q],
         "Faire p (normiert)": [pH, pD, pA]
     })
     st.table(tbl.style.format({
-        f"Quote ({quoten_label})": "{:.2f}",
+        f"Quote ({label})": "{:.2f}",
         "Implied p (unnormiert)": "{:.3f}",
         "Faire p (normiert)": "{:.3f}"
     }))
-    st.caption(f"Overround {quoten_label}: {overround:.3f}. "
+    st.caption(f"Overround {label}: {overround:.3f}. "
                "Je größer >1, desto höher die Buchmachermarge. Wir normalisieren auf Summe=1.")
-
-    with st.expander("🧠 Wie funktioniert die Vorhersage?"):
-        st.markdown("""
-- **Training:** viele historische Spiele (Teams → One-Hot, Quoten, abgeleitete Features).
-- **Vorhersage:** nutzt **nur** die aktuell eingegebenen/geladenen Quoten.
-- **Historischer Modus:** lädt **nur** die damaligen Quoten (Backtest).
-- **Vergleich:** „faire“ Quoten-Prozente sind 1/Quote (Overround entfernt).
-""")
-
